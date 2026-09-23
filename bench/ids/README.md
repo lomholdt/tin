@@ -19,3 +19,12 @@ Without Postgres (profiling tin-core; caches the built segments in the data dir)
 ```sh
 cargo run --release -p tin-bench --bin ids -- data/ids [KIND] [REPEAT]
 ```
+
+Update storm ([results](../../docs/BENCHMARKS-IDS.md#phase-6-update-storm)), after the steps above:
+
+```sh
+psql -f ../../bench/ids/storm/setup.sql        # per-engine tables, autovacuum settings
+sh ../../bench/ids/storm/run.sh shipments       # tin: 700k updates + concurrent search
+sh ../../bench/ids/storm/run.sh shipments_plain # plain Postgres: 700k updates
+psql -f ../../bench/ids/storm/verify.sql        # tin == B-tree on old/new bookings
+```

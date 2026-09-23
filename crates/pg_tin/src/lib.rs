@@ -70,7 +70,7 @@ fn tin_match(doc: &str, query: &str) -> bool {
 }
 
 thread_local! {
-    static LAST_SEARCH: std::cell::RefCell<Option<(String, i32, tin_core::SearchBox)>> =
+    static LAST_SEARCH: std::cell::RefCell<Option<(String, i32, tin_core::search::Matcher)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -81,7 +81,7 @@ fn search_tier(doc: &str, query: &str) -> Option<u8> {
         let mut last = last.borrow_mut();
         let typos = scan::SEARCH_TYPOS.get();
         if last.as_ref().is_none_or(|(q, t, _)| q != query || *t != typos) {
-            *last = Some((query.to_owned(), typos, scan::parse_search(query)));
+            *last = Some((query.to_owned(), typos, scan::parse_search(query).matcher()));
         }
         last.as_ref().unwrap().2.tier_of_text(doc, &mut Analyzer::new())
     })

@@ -29,8 +29,8 @@ Long-text ranking (BM25, phrases) and TIN-style big-corpus benchmarks still matt
 | 3 | **Identifier dataset + baselines** | 5M synthetic container / booking / B/L numbers; B-tree + `pg_trgm` (+ Typesense) latency and recall measured | ✅ done ([results](BENCHMARKS-IDS.md)) |
 | 4 | **Prefix, typo, fragment matching** | `msku12*`, `msku1243565~`, and fragment search each match a brute-force reference on 5M IDs | ✅ done ([results](BENCHMARKS-IDS.md#phase-4-prefix-typo-and-fragment-matching)) |
 | 5 | **Ranked top-k** | `ORDER BY col <~> 'q' LIMIT 10` through an ordered index scan that stops early; search-box p99 < 10 ms at 5M rows | ✅ done ([results](BENCHMARKS-IDS.md#phase-5-ranked-search-box)) |
-| 6 | **Identifier benchmark** | tin vs B-tree + `pg_trgm` vs Typesense: latency, recall@10, build time, size; **update storm** (700k updates/day, incl. the same rows over and over) | next |
-| 7 | Zero-copy reads, parallel build, background merges | No ~1 s index copy on a backend's first query; `CREATE INDEX` on all cores; merges off the insert path | moved up: right after 6 |
+| 6 | **Identifier benchmark** | tin vs B-tree + `pg_trgm` vs Typesense: latency, recall@10, build time, size; **update storm** (700k updates/day, incl. the same rows over and over) | ✅ done ([results](BENCHMARKS-IDS.md#phase-6-update-storm)) |
+| 7 | Flush/merge off the lock, zero-copy reads, parallel build | No search stalls during flushes/merges; no ~1 s index copy on a backend's first query; `CREATE INDEX` on all cores | next |
 | 8 | Long text | BM25 top-k, phrases, visibility-map `COUNT(*)`, big-corpus benchmark vs GIN / ParadeDB | |
 
 ## Phase 1: Postgres index access method ✅
@@ -87,15 +87,23 @@ At 5M rows, in Postgres:
 
 At 5M rows: every query kind has p99 < 7 ms (budget 2) or < 2 ms (budget 1), with the best recall of the three engines. Exact lookups (0.9 ms at budget 1) stay slower than a B-tree's 0.1 ms, because a top-10 must find the nine next-best rows too.
 
-## Phase 6: Update storm
+## Phase 6: Update storm ✅
 
-Real load: **~700,000 updates a day**, and in the worst case the *same* row updated over and over (a container whose booking changes `BOOK123456` → `BOOK89101112` → …). To measure:
+700k updates (a day's load), 10% of them on the same 100 rows, replayed in 168 s while searching ([results](BENCHMARKS-IDS.md#phase-6-update-storm)):
 
-- search latency and correctness (index = seqscan) *during* the updates, including for the hot rows;
-- index growth, pending-list flushes, merges and VACUUM keeping up;
-- the settings to document:
-  - `fillfactor`, which leaves room for HOT updates. HOT only applies when no indexed column changes, though, and a booking change rewrites the indexed text, so each such update is a new index entry plus a dead one.
-  - autovacuum tuned per table, so dead tuples are cleared quickly.
+- 0 wrong results during and after; the index size was stable (+0.3%).
+- 4,170 updates/s vs 3,043 for plain Postgres's six indexes.
+- Search p50 / p99 3.5 / 6.8 ms during the storm.
+- Fixed on the way: pending-list scans (38 → 5.9 ms at 75k records), and `tin.pending_list_limit` now defaults to 1 MB.
+- Documented: per-table autovacuum; why `fillfactor` / HOT don't apply to booking changes.
+
+**Found**: 0.05% of searches stall 0.3–1.9 s while an insert flushes or merges inline under the metapage lock. That leads Phase 7.
+
+## Phase 7: Flush/merge off the lock, zero-copy reads, parallel build
+
+1. **Build flush and merge output outside the metapage lock**, and take the lock only to swap it in. Liveness bits cleared meanwhile have to be carried over to the new segment, since VACUUM may run in between.
+2. **Zero-copy reads**: segments read in place from shared buffers, so there's no ~1 s per-backend copy on the first query.
+3. **Parallel `CREATE INDEX`**: build segments on all cores, then merge (103 s → ~35 s at 5M rows).
 
 ## Performance backlog (from Phase 0 profiling)
 

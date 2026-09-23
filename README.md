@@ -11,7 +11,7 @@ The core idea: **postings are Postgres ctids stored as two-level bitmaps**, with
 
 ## Status
 
-**Phases 0–5 are done** (of 0–8): the Rust engine, and a **PostgreSQL 18 index access method** with writes, VACUUM, crash safety, and identifier search: prefix, fragment, and typo-tolerant matching.
+**Phases 0–6 are done** (of 0–8): the Rust engine, and a **PostgreSQL 18 index access method** with writes, VACUUM, crash safety, and identifier search: prefix, fragment, and typo-tolerant matching.
 
 ```sql
 CREATE EXTENSION pg_tin;
@@ -35,12 +35,13 @@ SELECT * FROM shipments WHERE search_text ~> 'MSKU60128' ORDER BY search_text <~
 | Speed (4 threads, COUNT) | 11k–22k queries/s, 1.5–2.4× an uncompressed in-RAM baseline; p99 ≈ 1.4 ms or better |
 | In PostgreSQL 18 vs GIN | build 35.5 s vs 55.8 s; size 157 MB vs 388 MB; median 2.2–2.5× faster on selective queries; index = seqscan on 40/40 sampled queries |
 | 5M shipping IDs vs plain Postgres / Typesense | ranked search box, p99 ≤ 2 ms for every query kind at `tin.search_typos = 1`; best recall of the three (fragments 98–100% hit@10, typos 100%) ([details](docs/BENCHMARKS-IDS.md)) |
+| Update storm (a day's 700k updates in 168 s, hot rows) | 0 wrong results; 4,170 updates/s vs 3,043 for plain Postgres; index size stable; search p99 6.8 ms during the storm ([details](docs/BENCHMARKS-IDS.md#phase-6-update-storm)) |
 
 The details, including where we deviate from the posts and why, are in:
 
 - [docs/DESIGN.md](docs/DESIGN.md)
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/BENCHMARKS-IDS.md](docs/BENCHMARKS-IDS.md) (identifier search)
-- [docs/ROADMAP.md](docs/ROADMAP.md): aimed at Typesense-style search over ~5M shipping identifiers. Next up: Phase 6, the full benchmark incl. an update storm, then zero-copy reads and a parallel build.
+- [docs/ROADMAP.md](docs/ROADMAP.md): aimed at Typesense-style search over ~5M shipping identifiers. Next up: Phase 7, flushes and merges off the lock, zero-copy reads, and a parallel build.
 
 ## Layout
 

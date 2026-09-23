@@ -175,7 +175,7 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 - **`aminsert`** analyzes the value and appends a `(tid, sorted distinct terms)` record to the pending list.
   - It holds the metapage lock exclusively, so inserts into one index are serialized.
   - The record's last chunk and the metapage update go into the same Generic WAL record.
-- **Flush**: past `tin.pending_list_limit` (default 4 MB), at VACUUM, or on `tin_flush()`, the pending records become a new immutable segment (`SegmentBuilder::add_terms`).
+- **Flush**: past `tin.pending_list_limit` (default 1 MB; see [BENCHMARKS-IDS](BENCHMARKS-IDS.md#phase-6-update-storm)), at VACUUM, or on `tin_flush()`, the pending records become a new immutable segment (`SegmentBuilder::add_terms`).
 - **Merges**: segments are grouped by size into tiers (64 kB × 8ᵗ). When 8 segments share a tier they are merged into one (`Segment::merge` drops dead tuples), so the segment count stays logarithmic.
   - Segments over 64 MB (for example from `CREATE INDEX`) are not merged inline; REINDEX compacts them.
   - Merged-away chains are *retired*, and only recycled by the next VACUUM's cleanup (see below).

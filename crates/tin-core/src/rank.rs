@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use rustc_hash::FxHashSet;
 
 use crate::query::{Plan, SortedTerms};
-use crate::search::{SearchBox, MAX_TIER};
+use crate::search::{Matcher, SearchBox, MAX_TIER};
 use crate::segment::{Segment, TermFilter};
 use crate::tid::Tid;
 
@@ -57,7 +57,11 @@ pub struct Hit {
 
 pub struct Ranked {
     query: SearchBox,
+    matcher: Matcher,
     filter: Option<Plan>,
+    /// Per pending document, computed once per scan: its tier (`NO_TIER`
+    /// if none) and whether it passes the filter.
+    pending: Option<Vec<(u8, bool)>>,
     /// Current tier; `NO_TIER` for the filter-only rest; past it, done.
     tier: u8,
     step: Step,
@@ -77,8 +81,10 @@ enum Step {
 impl Ranked {
     pub fn new(query: SearchBox, filter: Option<Plan>) -> Ranked {
         Ranked {
+            matcher: query.matcher(),
             query,
             filter,
+            pending: None,
             tier: 0,
             step: Step::Start,
             emitted: FxHashSet::default(),
@@ -155,17 +161,26 @@ impl Ranked {
                 }
             }
         }
-        // Pending records are matched exactly, against the full tier.
-        let full = match tier {
-            NO_TIER => None,
-            t => Some(self.query.plan(t)),
-        };
-        for PendingDoc { tid, terms } in src.pending {
-            let (tid, doc) = (*tid, SortedTerms(terms));
-            let hit = full.as_ref().is_none_or(|p| p.matches(&doc))
-                && self.filter.as_ref().is_none_or(|f| f.matches(&doc));
-            if hit && self.emitted.insert(tid) {
-                self.buf.push_back(Hit { tid, tier, recheck: false, tier_is_bound: false });
+        // Pending documents are matched exactly.
+        self.pending_hits(src, |t, ok| ok && t <= tier, tier);
+    }
+
+    /// Buffer pending documents for which `pick(tier, passes_filter)`, as
+    /// tier `tier`.
+    fn pending_hits(&mut self, src: &Sources<'_>, pick: impl Fn(u8, bool) -> bool, tier: u8) {
+        let (matcher, filter) = (&self.matcher, &self.filter);
+        let info = self.pending.get_or_insert_with(|| {
+            src.pending
+                .iter()
+                .map(|d| {
+                    let t = matcher.tier_of_terms(&d.terms).unwrap_or(NO_TIER);
+                    (t, filter.as_ref().is_none_or(|f| f.matches(&SortedTerms(&d.terms))))
+                })
+                .collect()
+        });
+        for (d, &(t, ok)) in src.pending.iter().zip(info.iter()) {
+            if pick(t, ok) && self.emitted.insert(d.tid) {
+                self.buf.push_back(Hit { tid: d.tid, tier, recheck: false, tier_is_bound: false });
             }
         }
     }
@@ -193,12 +208,8 @@ impl Ranked {
             };
             return;
         }
-        // Segments done: pending records of this tier.
-        for PendingDoc { tid, terms } in src.pending {
-            if self.query.tier_of_terms(terms).is_some_and(|t| t <= tier) && self.emitted.insert(*tid) {
-                self.buf.push_back(Hit { tid: *tid, tier, recheck: false, tier_is_bound: false });
-            }
-        }
+        // Segments done: pending documents of this tier.
+        self.pending_hits(src, |t, _| t <= tier, tier);
     }
 }
 

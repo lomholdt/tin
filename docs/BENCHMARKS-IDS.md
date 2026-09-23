@@ -248,3 +248,52 @@ WHERE search_text ~> $1 ORDER BY search_text <~> $1 LIMIT 10;
 3. **Typo automaton → lazy DFA**: each DP state is computed once, and after that a transition is a table lookup. That halved the 2-typo walk (12 → 6 ms for 13-character B/Ls).
 4. **One segment after `CREATE INDEX`**: the build keeps its segments in memory, up to half of `maintenance_work_mem`, and merges them at the end. Every dictionary walk then touches one FST instead of three, making typo walks 2–2.7× faster. The merge adds 14 s to the 5M build (91 → 103 s).
 5. **Planner**: Postgres costs one index path for both the ordered and the bitmap scan. So the `~>` row estimate has to exceed the LIMIT before the planner sees that an ordered scan stops early. The estimate now includes a flat allowance of 20 rows for queries with typo tiers.
+
+## Phase 6: update storm
+
+Real load is **~700,000 updates a day**. In the worst case it's the same container rebooked again and again (`BOOK123456` → `BOOK89101112` → …). We replay a whole day's worth as fast as the machine allows (`bench/ids/storm/`):
+
+- **Writes:** 700k updates of `booking_no` from 3 clients. 90% hit random rows; 10% hit the same **100 hot rows** (~700 updates each).
+- **Reads, at the same time:** 1 client running the search box (`search_tin1`), plus hot-row checks. A check reads a hot row's current booking, then searches for it in the same snapshot; a miss aborts the run.
+- **Tables:** each engine on its own table with only its own indexes. `shipments` has the primary key + tin; `shipments_plain` has the primary key + 3 B-trees + 3 `pg_trgm` GINs.
+- **Autovacuum:** per-table threshold of 20k dead tuples, no cost delay.
+
+| | tin | plain Postgres |
+|---|---:|---:|
+| 700k updates took | **168 s (4,170/s)** | 230 s (3,043/s) |
+| All indexes (incl. primary key), before → after | 713 → 715 MB (**+0.3%**) | 827 → 937 MB (+13%) |
+| Search during the storm, p50 / p99 | **3.5 / 6.8 ms** (quiet: 1.2 / 2.6) | — (typo search takes seconds) |
+| Hot-row checks during the storm | 3,068, **0 misses** | — |
+| After: tin vs a B-tree on the old and new bookings of 1,100 sampled rows | 1,470 probes, **0 mismatches** | — |
+
+The whole day's load took under 3 minutes, about 500× the real rate. At the real rate (~8 updates/s) tin's write path is idle >99% of the time.
+
+**Reading it**
+
+- **Correct under churn.** Every hot row is found by its latest booking, both during the storm and after it. Old bookings no longer find it: the liveness bitmaps and the pending-list rewrite in VACUUM do their job.
+- **Faster writes than plain Postgres.** One tin index costs less per update than six B-tree/GIN indexes, and it answers more kinds of search.
+- **Size is stable.** Freed pages go back through the FSM, and the big segment built by `CREATE INDEX` only has bits cleared.
+- **Search slows about 3× under a storm, and there are rare stalls.**
+  - p50 3.5 ms vs 1.2 ms quiet. Part of that is CPU (4 cores shared by 3 writers, autovacuum and the searcher); part is the pending list, which every search scans.
+  - 0.05% of searches took 0.3–1.9 s. They line up with pending-list flushes (every ~5 s at this rate) and 8-way segment merges (~40 s). Both run inline, holding the metapage lock that readers take to refresh their cache. Moving them off the lock is the first item of Phase 7.
+
+**Tuning found on the way**
+
+- **Pending list: scan it cheaply.** Before the fix, every search checked every pending record, at every tier, with an allocating edit-distance function. That took 38 ms per search with 75k pending records. Now the search box is compiled once per query (typo DFAs, cheap checks first) and each record's tier is computed once per scan: 5.9 ms.
+- **`tin.pending_list_limit` default: 4 MB → 1 MB.**
+
+  | Limit | Updates/s | Search p50 / p99 during a 200k storm | Index after |
+  |---|---:|---:|---:|
+  | 4 MB | 3,928 | 3.8 / 9.8 ms | 532 MB |
+  | **1 MB** | **4,096** | **3.3 / 6.7 ms** | 532 MB |
+  | 256 kB | 3,615 | 2.8 / 6.3 ms | 606 MB |
+
+**Settings for this workload**
+
+- **Autovacuum per table, aggressive.** Every booking change touches the indexed text, so none of these updates can be HOT. Each one leaves a dead heap tuple and a dead index entry until VACUUM runs:
+  ```sql
+  ALTER TABLE shipments SET (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 20000,
+                             autovacuum_vacuum_insert_scale_factor = 0, autovacuum_vacuum_cost_delay = 0);
+  ```
+- **`fillfactor`** doesn't help here, for the same reason. It only pays off for updates that leave every indexed column alone, e.g. a status column outside the search text.
+- **Keep `search_text` narrow.** Only the identifiers people search for belong in the indexed text; other columns can then change with HOT updates and no tin work at all.

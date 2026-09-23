@@ -16,7 +16,9 @@
 //! no tier means no match. [`SearchBox::plan`] gives the index plan for
 //! "tier ≤ L", so an index can produce matches tier by tier and stop early.
 
-use crate::pattern::osa_within;
+use fst::Automaton;
+
+use crate::pattern::OsaDfa;
 use crate::query::Plan;
 use crate::tokenize::Analyzer;
 
@@ -95,14 +97,64 @@ impl SearchBox {
     }
 
     /// The tier of a document with these (analyzed) terms, if it matches.
+    /// (Compiles a [`Matcher`]; keep one to check many documents.)
+    pub fn tier_of_terms<S: AsRef<str>>(&self, doc: &[S]) -> Option<u8> {
+        self.matcher().tier_of_terms(doc)
+    }
+
+    pub fn tier_of_text(&self, text: &str, analyzer: &mut Analyzer) -> Option<u8> {
+        self.tier_of_terms(&analyzer.unique_terms(text))
+    }
+
+    /// This query compiled for checking many documents.
+    pub fn matcher(&self) -> Matcher {
+        let terms = self
+            .terms
+            .iter()
+            .map(|q| TermMatcher {
+                q: q.clone(),
+                fragment: self.allows(q, 2),
+                typo1: self.allows(q, 3).then(|| OsaDfa::new(q.as_bytes(), 1)),
+                typo2: self.allows(q, 4).then(|| OsaDfa::new(q.as_bytes(), 2)),
+            })
+            .collect();
+        Matcher { terms }
+    }
+}
+
+/// A [`SearchBox`] compiled for checking many documents (pending records,
+/// rechecks): typo automata built once, cheap tests before them. Checking a
+/// document term allocates nothing.
+pub struct Matcher {
+    terms: Vec<TermMatcher>,
+}
+
+struct TermMatcher {
+    q: String,
+    fragment: bool,
+    typo1: Option<OsaDfa>,
+    typo2: Option<OsaDfa>,
+}
+
+impl Matcher {
     pub fn tier_of_terms<S: AsRef<str>>(&self, doc: &[S]) -> Option<u8> {
         if self.terms.is_empty() {
             return None;
         }
         let mut worst = 0;
-        for q in &self.terms {
-            let best = doc.iter().filter_map(|d| self.term_tier(q, d.as_ref())).min()?;
-            worst = worst.max(best);
+        for t in &self.terms {
+            let mut best = None;
+            for d in doc {
+                if let Some(x) = t.tier(d.as_ref()) {
+                    if best.is_none_or(|b| x < b) {
+                        best = Some(x);
+                        if x == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            worst = worst.max(best?);
         }
         Some(worst)
     }
@@ -110,23 +162,41 @@ impl SearchBox {
     pub fn tier_of_text(&self, text: &str, analyzer: &mut Analyzer) -> Option<u8> {
         self.tier_of_terms(&analyzer.unique_terms(text))
     }
+}
 
-    /// How well document term `d` matches query term `q`.
-    fn term_tier(&self, q: &str, d: &str) -> Option<u8> {
+impl TermMatcher {
+    /// How well document term `d` matches this query term.
+    fn tier(&self, d: &str) -> Option<u8> {
+        let q = self.q.as_str();
         if d == q {
-            Some(0)
-        } else if d.starts_with(q) {
-            Some(1)
-        } else if self.allows(q, 2) && d.contains(q) {
-            Some(2)
-        } else if self.allows(q, 3) && osa_within(d, q, 1) {
-            Some(3)
-        } else if self.allows(q, 4) && osa_within(d, q, 2) {
-            Some(4)
-        } else {
-            None
+            return Some(0);
         }
+        if d.starts_with(q) {
+            return Some(1);
+        }
+        if self.fragment && d.contains(q) {
+            return Some(2);
+        }
+        let diff = d.len().abs_diff(q.len());
+        if diff <= 1 && self.typo1.as_ref().is_some_and(|a| accepts(a, d)) {
+            return Some(3);
+        }
+        if diff <= 2 && self.typo2.as_ref().is_some_and(|a| accepts(a, d)) {
+            return Some(4);
+        }
+        None
     }
+}
+
+fn accepts(dfa: &OsaDfa, d: &str) -> bool {
+    let mut s = dfa.start();
+    for &c in d.as_bytes() {
+        if !dfa.can_match(&s) {
+            return false;
+        }
+        s = dfa.accept(&s, c);
+    }
+    dfa.is_match(&s)
 }
 
 fn term_has_tier(q: &str, tier: u8) -> bool {
