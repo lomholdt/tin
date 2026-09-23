@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/tin-core", "crates/tin-bench"]
+members = ["crates/tin-core", "crates/tin-bench", "crates/pg_tin"]
+# pg_tin needs cargo-pgrx + Postgres headers; build it explicitly with -p.
+default-members = ["crates/tin-core", "crates/tin-bench"]
 
 [workspace.package]
 version = "0.1.0"

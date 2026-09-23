@@ -1,0 +1,6 @@
+comment = 'tin: ctid two-level-bitmap full-text index'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_tin'
+relocatable = false
+superuser = true
+trusted = false

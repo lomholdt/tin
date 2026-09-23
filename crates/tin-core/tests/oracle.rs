@@ -245,3 +245,34 @@ fn skip_blocked_sparse_lists_match_oracle() {
     }
     assert_eq!(q, 432);
 }
+
+#[test]
+fn open_ended_segments_and_single_doc_matcher_agree() {
+    let c = corpus(13);
+    // Cut into open-ended segments every ~500 docs at block boundaries.
+    let mut segments = Vec::new();
+    let mut b = SegmentBuilder::open_ended(0);
+    let mut last_block = 0;
+    for (tid, text) in &c.docs {
+        if b.doc_count() >= 500 && tid.block != last_block {
+            segments.push(b.finish());
+            b = SegmentBuilder::open_ended(tid.block);
+        }
+        b.add(*tid, text);
+        last_block = tid.block;
+    }
+    segments.push(b.finish());
+    assert!(segments.len() > 3);
+    let idx = Index::from_segments(segments);
+
+    let mut rng = Rng(5);
+    let mut a = Analyzer::new();
+    for _ in 0..150 {
+        let plan = random_plan(&mut rng, 3);
+        let want: Vec<Tid> = eval(&plan, &c.truth).into_iter().collect();
+        assert_eq!(idx.search_vec(&plan), want, "{plan:?}");
+        let scanned: Vec<Tid> =
+            c.docs.iter().filter(|(_, text)| plan.matches_text(text, &mut a)).map(|(t, _)| *t).collect();
+        assert_eq!(scanned, want, "matches_text {plan:?}");
+    }
+}

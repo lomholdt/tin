@@ -187,6 +187,16 @@ fn main() {
         );
     }
 
+    // `TIN_DUMP_QUERIES=path`: write the query set (kind<TAB>query per line)
+    // for running the same mix through Postgres, then exit.
+    if let Ok(path) = std::env::var("TIN_DUMP_QUERIES") {
+        let qs = QuerySet::generate(&index, args.per_kind, args.seed);
+        let lines: Vec<String> = qs.all().iter().map(|q| format!("{}\t{}", q.kind.name(), q.text)).collect();
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write queries");
+        eprintln!("wrote {} queries to {path}", lines.len());
+        return;
+    }
+
     // Profiling hook: `TIN_PROFILE=conjunction` runs just that kind on TIN
     // (single thread) and exits, for use under callgrind/perf. Add
     // `TIN_PROFILE_MODE=tids` to materialize tids instead of counting.

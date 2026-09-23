@@ -1,4 +1,4 @@
-# Benchmarks (Phase 0)
+# Benchmarks
 
 ## Setup
 
@@ -104,6 +104,50 @@ Latency is single-threaded, one query at a time; QPS runs the whole set on 4 thr
 - **Build**: 12 s for 1.24M docs on 4 threads, ~100k docs/s or 72 MB/s of text. TIN built 85 GB in 8m10s (~173 MB/s) on 8 vCPUs.
 
 **These numbers are not comparable to TIN's published figures.** Their tables measure end-to-end SQL against Postgres on 150M documents with disk I/O. Ours measure the engine alone, in memory, on a corpus about 1/100th the size. The comparison that matters comes in Phase 6, when the same query mix runs through Postgres against GIN and ParadeDB.
+
+## Inside PostgreSQL 18 (Phase 1)
+
+The same corpus loaded into a real table, `posts (id bigserial, body text)`, with a tin index and, for comparison, a GIN index on `to_tsvector('simple', body)`. The `simple` config has no stemming and no stop words, like tin.
+
+- **Setup**: PostgreSQL 18.6, same 4-vCPU container, `shared_buffers = 1GB`.
+- **Real heap**: 100,232 pages, 12.4 tuples per page. The Phase 0 simulator predicted 13.2, so it was close.
+
+### Build and size
+
+| | tin | GIN (`simple`) |
+|---|---:|---:|
+| `CREATE INDEX` (`maintenance_work_mem = 1GB`) | **35.5 s** | 55.8 s |
+| Index size | **157 MB** (2 segments) | 388 MB |
+| Index / heap | 20% | 50% |
+
+The first tin build took 3m05s. Its memory-limit check walked every term after every heap page; making that an O(1) counter took it to 35.5 s.
+
+### Correctness
+
+- 40 of the 1,000 queries (10 per kind) were run twice: through the index, and as a parallel sequential scan that calls `tin_match` on every row.
+- **40/40 returned identical ctid sets**, compared as the md5 of the ordered ctid list; 898,798 matching rows in total.
+
+### Query latency
+
+- **Queries**: 400 of the Phase 0 queries, 100 per kind, each run as `SELECT count(*) … WHERE body ==> $1` and, for GIN, the equivalent `plainto_tsquery` expression.
+- **Measurement**: timed inside the server with `clock_timestamp()`, one backend, no parallel workers, second of two passes (caches warm).
+- **`work_mem = 256MB`**: with the default 4 MB, big results make the bitmap lossy, and both indexes then spend their time re-tokenizing rows on rechecks.
+
+| Query kind | Engine | Avg matches | p50 | p99 | Queries/s (1 core) |
+|---|---|---:|---:|---:|---:|
+| Conjunction | **tin** | 710 | **0.29 ms** | **13.6 ms** | **847** |
+| Conjunction | GIN | 707 | 0.74 ms | 17.4 ms | 483 |
+| Disjunction | **tin** | 101,994 | **49.3 ms** | **235 ms** | **17** |
+| Disjunction | GIN | 103,999 | 54.7 ms | 262 ms | 15 |
+| Mixed | **tin** | 3,957 | **0.90 ms** | **71.1 ms** | **217** |
+| Mixed | GIN | 3,940 | 1.96 ms | 82.4 ms | 146 |
+| Negation | **tin** | 1,131 | **0.37 ms** | **25.0 ms** | **562** |
+| Negation | GIN | 1,163 | 0.94 ms | 32.4 ms | 302 |
+
+- **tin wins on every kind**: 2.2–2.5× on median latency for selective queries, and 1.1–1.9× on throughput.
+- **Disjunctions** are dominated by the heap: `count(*)` over ~100k rows visits ~100k tuples either way. Phase 4's visibility-map count avoids those visits.
+- **Match counts differ slightly** (for example 710 vs 707), because Postgres's text parser and UAX #29 split some tokens differently (`fox's`, `3.14`, URLs).
+- **First query in a new connection: 257 ms**, the time to load the 157 MB index into that backend's cache. After that, 2.7 ms for the same query. Reading straight from shared buffers (Phase 3) removes this.
 
 ## How we got here
 

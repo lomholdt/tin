@@ -3,30 +3,22 @@
 | # | Phase | Done when | Status |
 |---|---|---|---|
 | 0 | Core engine, outside Postgres: tokenizer, dictionary, two-level bitmaps, AND/OR/NOT, COUNT | Correct on real data + first speed numbers | ✅ done |
-| 1 | Postgres index access method (read-only) | `CREATE INDEX … USING tin (col)` and `WHERE col ==> 'query'` work | next |
-| 2 | Writes + deletes | Inserts, updates and VACUUM are correct; survives a crash and a replica | |
+| 1 | Postgres 18 index access method (read-only) | `CREATE INDEX … USING tin (col)` and `WHERE col ==> 'query'` work; index = seqscan results | ✅ done |
+| 2 | Writes + deletes | Inserts, updates and VACUUM are correct; survives a crash and a replica | next |
 | 3 | Background merging | Merges run in a background worker without blocking writes or readers | |
 | 4 | Ranking + fast count | `ORDER BY tin.score(ctid) DESC LIMIT 10` and `COUNT(*)` are fast | |
 | 5 | Phrases, fuzzy, wildcards | `"san francisco"`, `jeens~1`, `denim*`, regex | |
 | 6 | Benchmarks | Same query mix vs GIN, ParadeDB and pg_textsearch on a bigger machine | |
 
-## Phase 1 — Postgres index access method
+## Phase 1: Postgres index access method ✅
 
-Built with **pgrx** (Rust), as a new `pg_tin` crate that depends on `tin-core`.
+Done: a pgrx 0.18 extension for PostgreSQL 18 (`crates/pg_tin`). See [DESIGN.md](DESIGN.md#postgres-integration-phase-1-cratespg_tin) and [BENCHMARKS.md](BENCHMARKS.md#inside-postgresql-18-phase-1).
 
-- **Index AM handler**:
-  - `ambuild`: parallel heap scan by block range → one segment per range, the same split `Index::build` uses.
-  - `aminsert`: a stub that errors until Phase 2.
-  - `ambeginscan` / `amrescan` / `amgetbitmap`: `drive()` a cursor and add tids to the `TIDBitmap`.
-  - `amcostestimate`: from the terms' document frequencies.
-  - `amvacuumcleanup`: a no-op for now.
-- **Operator + opclass**: `text ==> text`; the right side is parsed with `Plan::parse`.
-- **Storage in index pages**:
-  - Segments are written into the index relation's 8 KB pages, logged through Generic WAL.
-  - A metapage holds the segment manifest.
-  - The segment format already has everything a page layout needs: postings are position-independent offsets, and there are 16 bytes of tail padding.
-- **Page directory from the heap**: the build scan records each block's max offset (`PageGetMaxOffsetNumber`).
-- **Done when**: `EXPLAIN` shows a Bitmap Index Scan on `tin`, and results match `to_tsvector(...) @@ ...` on the Super User corpus loaded into Postgres.
+- ✅ `CREATE INDEX … USING tin`, the `==>` operator, the `text_tin_ops` opclass, and bitmap scans.
+- ✅ A memory-bounded streaming build: segments are cut at `maintenance_work_mem`, stored in index pages, and WAL-logged with `log_newpage_range`.
+- ✅ The planner picks the index. On Super User, 40/40 sampled queries return exactly the same ctids through the index as through a sequential scan.
+- ✅ SQL regression test (`scripts/pg-test.sh`) and a CI job on PG18.
+- Left for later: inserts (Phase 2), zero-copy reads from shared buffers instead of a per-backend copy (Phase 3), and real selectivity estimates (Phase 4).
 
 ## Phase 2 — Writes, deletes, crash safety
 

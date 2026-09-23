@@ -1,0 +1,21 @@
+[package]
+name = "pg_tin"
+description = "Postgres index access method for tin (pgrx)."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.18.1"
+tin-core.workspace = true
+
+[dev-dependencies]
+pgrx-tests = "=0.18.1"

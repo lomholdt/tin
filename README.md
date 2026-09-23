@@ -11,7 +11,13 @@ The core idea: **postings are Postgres ctids stored as two-level bitmaps**, with
 
 ## Status
 
-**Phase 0 of 7 is done**: a standalone Rust engine (no Postgres yet).
+**Phases 0–1 of 7 are done**: the Rust engine, and a **PostgreSQL 18 index access method** (read-only after `CREATE INDEX` for now).
+
+```sql
+CREATE EXTENSION pg_tin;
+CREATE INDEX posts_body_tin ON posts USING tin (body);
+SELECT count(*) FROM posts WHERE body ==> 'grub (uefi OR bios) -windows';
+```
 
 | | |
 |---|---|
@@ -19,12 +25,13 @@ The core idea: **postings are Postgres ctids stored as two-level bitmaps**, with
 | Corpus | Super User Stack Exchange, 1.24M posts, 0.88 GB |
 | Index size | **19.4% of the text** (TIN post: "roughly 20%" for a minimal index) |
 | Speed (4 threads, COUNT) | 11k–22k queries/s, 1.5–2.4× an uncompressed in-RAM baseline; p99 ≈ 1.4 ms or better |
+| In PostgreSQL 18 vs GIN | build 35.5 s vs 55.8 s; size 157 MB vs 388 MB; median 2.2–2.5× faster on selective queries; index = seqscan on 40/40 sampled queries |
 
 The details, including where we deviate from the posts and why, are in:
 
 - [docs/DESIGN.md](docs/DESIGN.md)
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
-- [docs/ROADMAP.md](docs/ROADMAP.md) (next: Phase 1, a pgrx index access method)
+- [docs/ROADMAP.md](docs/ROADMAP.md) (next: Phase 2, inserts and deletes)
 
 ## Layout
 
@@ -39,13 +46,15 @@ crates/tin-core    storage format + query engine (library)
   segment.rs       segment build, serialize, search
   index.rs         parallel multi-segment build
 crates/tin-bench   heap-layout simulator, query generator, baseline, report
+crates/pg_tin      PostgreSQL 18 extension (pgrx 0.18): index AM, ==> operator
 scripts/           corpus download + preparation
 ```
 
 ## Try it
 
 ```sh
-cargo test                                   # unit + randomized oracle tests
+cargo test                                   # unit + randomized oracle tests (engine)
+PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config sh scripts/pg-test.sh   # extension SQL tests
 sh scripts/fetch-superuser.sh                # ~1.3 GB download, needs 7z + python3
 cargo run --release -p tin-bench -- data/superuser.docs.txt --queries-per-kind 1000
 ```
@@ -58,5 +67,7 @@ let index = Index::build(&docs, 1);
 let plan = Plan::parse("denim -jacket", &mut Analyzer::new()).unwrap();
 assert_eq!(index.search_vec(&plan), vec![Tid::new(0, 1)]);
 ```
+
+The extension needs PostgreSQL 18 with server headers (`postgresql-server-dev-18`), `libclang`, and `cargo install cargo-pgrx --version 0.18.1 --locked && cargo pgrx init --pg18 $(which pg_config)`. Install it with `cd crates/pg_tin && cargo pgrx install --release`.
 
 Builds use `-C target-cpu=native` (see `.cargo/config.toml`) so the bitmap loops compile to AVX2/AVX-512. To profile under valgrind, which can't run AVX-512, build with `RUSTFLAGS="-C target-cpu=x86-64-v3"` and set `TIN_PROFILE=conjunction` to run just that query kind.

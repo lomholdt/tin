@@ -53,6 +53,8 @@ pub struct SegmentBuilder {
     widths: Vec<u16>,
     last_tid: Option<Tid>,
     doc_count: u64,
+    open_ended: bool,
+    approx_bytes: usize,
 }
 
 impl SegmentBuilder {
@@ -68,7 +70,28 @@ impl SegmentBuilder {
             widths: Vec::new(),
             last_tid: None,
             doc_count: 0,
+            open_ended: false,
+            approx_bytes: 0,
         }
+    }
+
+    /// A builder whose end is not known up front (streaming builds): the
+    /// segment ends after the last block that received a tuple.
+    pub fn open_ended(first_block: u32) -> Self {
+        let mut b = Self::new(first_block, u32::MAX);
+        b.open_ended = true;
+        b
+    }
+
+    pub fn doc_count(&self) -> u64 {
+        self.doc_count
+    }
+
+    /// Rough heap footprint, for memory-bounded builds. O(1): maintained as
+    /// postings and terms are added (postings counted at 12 bytes for
+    /// `Vec` growth slack).
+    pub fn approx_bytes(&self) -> usize {
+        self.approx_bytes + self.widths.len() * 2
     }
 
     /// Index one tuple. Tids must be strictly ascending and inside the
@@ -89,7 +112,7 @@ impl SegmentBuilder {
         }
         self.widths[page] = self.widths[page].max(tid.offset);
 
-        let Self { analyzer, term_ids, terms, postings, .. } = self;
+        let Self { analyzer, term_ids, terms, postings, approx_bytes, .. } = self;
         analyzer.for_each_term(text, |term, _pos| {
             let id = match term_ids.get(term) {
                 Some(&id) => id,
@@ -99,6 +122,8 @@ impl SegmentBuilder {
                     term_ids.insert(boxed.clone(), id);
                     terms.push(boxed);
                     postings.push(Vec::new());
+                    // Two copies of the term + map entry + Vec header.
+                    *approx_bytes += term.len() * 2 + 72;
                     id
                 }
             };
@@ -106,6 +131,7 @@ impl SegmentBuilder {
             // Boolean postings: one entry per tuple however often the term repeats.
             if list.last() != Some(&tid) {
                 list.push(tid);
+                *approx_bytes += 12;
             }
         });
     }
@@ -117,9 +143,12 @@ impl SegmentBuilder {
     /// Like [`finish`](Self::finish), also returning postings size per
     /// (frequency class, encoding). `class_of(df, doc_count)` picks the class.
     pub fn finish_with_stats<C: Ord + Copy>(
-        self,
+        mut self,
         class_of: impl Fn(u64, u64) -> C,
     ) -> (Segment, BTreeMap<(C, Encoding), ClassStats>) {
+        if self.open_ended {
+            self.end_block = self.last_tid.map_or(self.first_block, |t| t.block + 1);
+        }
         let mut order: Vec<u32> = (0..self.terms.len() as u32).collect();
         order.sort_unstable_by(|&a, &b| self.terms[a as usize].cmp(&self.terms[b as usize]));
 

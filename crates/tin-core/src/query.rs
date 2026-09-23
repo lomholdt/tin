@@ -213,6 +213,31 @@ impl Plan {
     }
 }
 
+impl Plan {
+    /// Evaluate against one document's term set. `has(term)` says whether
+    /// the document contains `term`.
+    pub fn matches(&self, has: &impl Fn(&str) -> bool) -> bool {
+        match self {
+            Plan::Term(t) => has(t),
+            Plan::And(cs) => cs.iter().all(|c| c.matches(has)),
+            Plan::Or(cs) => cs.iter().any(|c| c.matches(has)),
+            Plan::AndNot(p, n) => p.matches(has) && !n.matches(has),
+        }
+    }
+
+    /// Analyze `text` and evaluate against it: the non-index path (sequential
+    /// scans, rechecks) that must agree with index results.
+    pub fn matches_text(&self, text: &str, analyzer: &mut Analyzer) -> bool {
+        let mut terms = std::collections::HashSet::new();
+        analyzer.for_each_term(text, |t, _| {
+            if !terms.contains(t) {
+                terms.insert(t.to_owned());
+            }
+        });
+        self.matches(&|t| terms.contains(t))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +268,15 @@ mod tests {
         assert_eq!(plan("a OR -b"), Err(QueryError::UnboundedNegation));
         // A hyphen inside a word is not negation.
         assert_eq!(plan("e-mail").unwrap(), Plan::And(vec![t("e"), t("mail")]));
+    }
+
+    #[test]
+    fn matches_text() {
+        let mut a = Analyzer::new();
+        let p = plan("(denim OR chino) -stretch").unwrap();
+        assert!(p.matches_text("Raw DENIM jacket", &mut a));
+        assert!(!p.matches_text("stretch denim", &mut a));
+        assert!(!p.matches_text("wool coat", &mut a));
     }
 
     #[test]

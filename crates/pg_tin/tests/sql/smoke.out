@@ -1,0 +1,151 @@
+-- pg_tin regression test: run with scripts/pg-test.sh
+CREATE EXTENSION pg_tin;
+CREATE TABLE docs (id serial PRIMARY KEY, body text);
+INSERT INTO docs (body) VALUES
+  ('stretch denim jeans'), ('raw denim jacket'), ('stretch chinos'), (NULL),
+  ('Crème brûlée recipe'), ('grub bootloader uefi'), ('grub bios legacy boot'),
+  ('København harbour'), ('e-mail from GRUB'), ('');
+-- Enough rows to span several heap pages and index segments.
+INSERT INTO docs (body)
+  SELECT 'filler ' || i || CASE WHEN i % 7 = 0 THEN ' seven' ELSE '' END
+                        || CASE WHEN i % 11 = 0 THEN ' eleven' ELSE '' END
+  FROM generate_series(1, 20000) i;
+SET maintenance_work_mem = '1MB'; -- force several segments
+CREATE INDEX docs_body_tin ON docs USING tin (body);
+RESET maintenance_work_mem;
+SELECT count(*) > 1 AS several_segments, sum(bytes) > 0 AS has_data
+  FROM tin_segments('docs_body_tin'::regclass);
+ several_segments | has_data 
+------------------+----------
+ t                | t
+(1 row)
+
+SELECT * FROM tin_segments('docs'::regclass);
+ERROR:  tin: "docs" is not a tin index
+SET enable_seqscan = off;
+EXPLAIN (costs off) SELECT id FROM docs WHERE body ==> 'denim -jacket';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Bitmap Heap Scan on docs
+   Recheck Cond: (body ==> 'denim -jacket'::text)
+   ->  Bitmap Index Scan on docs_body_tin
+         Index Cond: (body ==> 'denim -jacket'::text)
+(4 rows)
+
+SELECT id, body FROM docs WHERE body ==> 'denim -jacket' ORDER BY id;
+ id |        body         
+----+---------------------
+  1 | stretch denim jeans
+(1 row)
+
+SELECT id FROM docs WHERE body ==> 'stretch' ORDER BY id;
+ id 
+----
+  1
+  3
+(2 rows)
+
+SELECT id FROM docs WHERE body ==> 'creme' ORDER BY id;
+ id 
+----
+  5
+(1 row)
+
+SELECT id FROM docs WHERE body ==> 'KØBENHAVN' ORDER BY id;
+ id 
+----
+  8
+(1 row)
+
+SELECT id FROM docs WHERE body ==> 'grub (uefi OR bios)' AND body ==> 'boot' ORDER BY id;
+ id 
+----
+  7
+(1 row)
+
+SELECT id FROM docs WHERE body ==> 'e-mail' ORDER BY id;
+ id 
+----
+  9
+(1 row)
+
+SELECT count(*) FROM docs WHERE body ==> 'seven';
+ count 
+-------
+  2857
+(1 row)
+
+SELECT count(*) FROM docs WHERE body ==> 'seven eleven';
+ count 
+-------
+   259
+(1 row)
+
+SELECT count(*) FROM docs WHERE body ==> 'seven OR eleven';
+ count 
+-------
+  4416
+(1 row)
+
+SELECT count(*) FROM docs WHERE body ==> 'filler -seven -eleven';
+ count 
+-------
+ 15584
+(1 row)
+
+SELECT count(*) FROM docs WHERE body ==> 'nothingmatches';
+ count 
+-------
+     0
+(1 row)
+
+-- Index and sequential scan must agree exactly.
+CREATE TEMP TABLE via_index AS
+  SELECT q, array_agg(id ORDER BY id) ids FROM docs,
+    unnest(ARRAY['seven', 'seven eleven', 'filler -seven', '(seven OR eleven) -filler', 'grub OR denim']) q
+  WHERE body ==> q GROUP BY q;
+RESET enable_seqscan;
+SET enable_bitmapscan = off;
+SELECT q, (SELECT array_agg(id ORDER BY id) FROM docs WHERE body ==> q) = ids AS same_as_seqscan
+  FROM via_index ORDER BY q;
+       q       | same_as_seqscan 
+---------------+-----------------
+ filler -seven | t
+ grub OR denim | t
+ seven         | t
+ seven eleven  | t
+(4 rows)
+
+RESET enable_bitmapscan;
+-- Errors.
+SELECT 'x' ==> '"a phrase"';
+ERROR:  tin: invalid query "\"a phrase\"": phrase queries are not supported yet
+SELECT 'x' ==> '-only';
+ERROR:  tin: invalid query "-only": negation needs a positive term beside it
+INSERT INTO docs (body) VALUES ('new row');
+ERROR:  tin: index "docs_body_tin" is read-only in this version; load the data first, then CREATE INDEX (or REINDEX)
+-- Deletes stay correct (Phase 1 keeps dead tids; visibility filters them).
+DELETE FROM docs WHERE id = 1;
+VACUUM docs;
+SET enable_seqscan = off;
+SELECT id FROM docs WHERE body ==> 'denim' ORDER BY id;
+ id 
+----
+  2
+(1 row)
+
+-- REINDEX builds a new generation; cached copies must not be reused.
+REINDEX INDEX docs_body_tin;
+SELECT id FROM docs WHERE body ==> 'denim' ORDER BY id;
+ id 
+----
+  2
+(1 row)
+
+TRUNCATE docs;
+SELECT count(*) FROM docs WHERE body ==> 'denim';
+ count 
+-------
+     0
+(1 row)
+

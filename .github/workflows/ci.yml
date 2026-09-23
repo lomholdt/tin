@@ -16,3 +16,25 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  pg18:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install PostgreSQL 18
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsS -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18 libclang-dev
+          # Let the runner user install the extension.
+          sudo chmod -R a+w /usr/share/postgresql/18/extension /usr/lib/postgresql/18/lib
+      - run: cargo install cargo-pgrx --version 0.18.1 --locked
+      - run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+      - run: cargo clippy -p pg_tin -- -D warnings
+      - run: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config sh scripts/pg-test.sh

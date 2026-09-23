@@ -103,11 +103,47 @@ Queries run **group at a time** over a tree of cursors (`Term`, `And`, `Or`, `An
 - Tokens over 64 bytes are dropped: hashes, base64 blobs.
 - Word positions are already produced, for phrases later.
 
-## What Phase 0 does not have yet
+## Postgres integration (Phase 1, `crates/pg_tin`)
+
+A pgrx extension for **PostgreSQL 18**, adding the `tin` index access method, the `==>` operator (`text ==> text`) and the default operator class `text_tin_ops`.
+
+```sql
+CREATE EXTENSION pg_tin;
+CREATE INDEX posts_body_tin ON posts USING tin (body);
+SELECT count(*) FROM posts WHERE body ==> 'grub (uefi OR bios) -windows';
+```
+
+- **Build (`ambuild`)**:
+  - A serial heap scan through `index_build_range_scan`, with `allow_sync = false` so it starts at block 0 and tids arrive in block order.
+  - HOT chains can report a root offset after higher offsets on the same page, so each page's tuples are buffered and sorted.
+  - A segment is closed at a page boundary once its builder passes `maintenance_work_mem`, written out, and dropped, so memory stays bounded for any table size.
+  - The page directory comes from the tids themselves: the highest offset seen per block.
+- **Storage**:
+  - Block 0 is a metapage (magic, version, segment table).
+  - Each segment's `to_bytes()` follows on consecutive standard pages, 8,168 payload bytes each.
+  - Pages are added with `ExtendBufferedRel` and WAL-logged at the end with `log_newpage_range` (full-page images), which is how GIN logs its build.
+  - Unlogged tables get an empty metapage in the init fork.
+- **Scans**:
+  - Bitmap scans only (`amgetbitmap`, no `amgettuple`), like GIN.
+  - Several `==>` conditions on the column are ANDed into one plan.
+  - Tids go to `tbm_add_tuples` in batches of 4,096, **without recheck**.
+- **Caching**:
+  - Each backend loads the index into memory on first use and keeps it, keyed by `(index OID, relfilenumber)`.
+  - REINDEX, TRUNCATE and VACUUM FULL all create a new relfilenumber, so a stale copy is never read.
+  - 🔧 This is a Phase 1 shortcut. Reading segments straight from shared buffers comes with Phase 3.
+- **Sequential scans / rechecks**: `tin_match(doc, query)` runs the same analyzer and `Plan::matches_text`, so both paths return identical rows (verified on 1.24M rows).
+- **Writes (Phase 1 limitation)**: the index is read-only. `aminsert` raises an error, so inserts and non-HOT updates into an indexed table fail: load first, then `CREATE INDEX`. `ambulkdelete` keeps dead tids. Returning them without recheck is still sound, because:
+  - a dead tuple is dropped by the heap visibility check;
+  - a reused line pointer can only hold a tuple from a failed (aborted) insert, or a heap-only tuple, and a bitmap heap scan never starts a HOT chain from one of those.
+
+  Phase 2 adds liveness bitmaps before inserts are allowed.
+- **Costing**: `genericcostestimate`, with `contsel` as the operator's selectivity estimate. Real selectivity from document frequencies is Phase 4.
+
+## What is not built yet
 
 These are all on the [roadmap](ROADMAP.md):
 
-- Postgres integration: index access method, WAL, VACUUM, liveness bitmaps, the visibility-map `COUNT(*)` shortcut.
+- Writes: inserts/updates into indexed tables, liveness bitmaps, the visibility-map `COUNT(*)` shortcut.
 - Mutable segments and merges.
 - BM25: term frequencies, document lengths, block-max top-k.
 - Phrases/spans, fuzzy/wildcard/regex.
