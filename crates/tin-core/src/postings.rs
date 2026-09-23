@@ -284,6 +284,18 @@ impl<'a> BitWriter<'a> {
 /// bytes past the end of the source data.
 #[inline]
 pub(crate) fn copy_bits_or(src: &[u8], src_bit: usize, dst: &mut [u64], dst_bit: usize, len: usize) {
+    if len <= 57 {
+        // One unaligned 8-byte load covers it (bit offset <= 7, 7 + 57 = 64).
+        let byte = src_bit >> 3;
+        let v = (u64::from_le_bytes(src[byte..byte + 8].try_into().unwrap()) >> (src_bit & 7))
+            & ((1u64 << len) - 1);
+        let (w, sh) = (dst_bit >> 6, dst_bit & 63);
+        dst[w] |= v << sh;
+        if sh + len > 64 {
+            dst[w + 1] |= v >> (64 - sh);
+        }
+        return;
+    }
     let (mut s, mut d, mut left) = (src_bit, dst_bit, len);
     while left > 0 {
         let n = left.min(64);
@@ -623,20 +635,38 @@ impl Cursor for GroupsCursor<'_> {
         if want.is_zero() {
             return;
         }
-        // Walk this term's page runs (each contiguous in the bitstream) in
-        // step with the wanted runs, which always lie inside one of them.
-        let mut term_runs = self.pages.runs();
-        let (mut run_lo, mut run_hi) = term_runs.next().unwrap();
-        let mut run_bit = self.stream_bit;
         let data = self.data;
-        for (lo, hi) in want.runs() {
-            while run_hi <= lo {
-                run_bit += space.start(run_hi) - space.start(run_lo);
-                (run_lo, run_hi) = term_runs.next().unwrap();
+        let mut src = self.stream_bit;
+        if want == self.pages {
+            // Every page of the term: its runs are consecutive in the
+            // bitstream, so each run is one copy and `src` just advances.
+            for (lo, hi) in want.runs() {
+                let (d, len) = (space.start(lo), space.start(hi) - space.start(lo));
+                copy_bits_or(data, src, out, d, len);
+                src += len;
             }
-            let dst = space.start(lo);
-            let src = run_bit + dst - space.start(run_lo);
-            copy_bits_or(data, src, out, dst, space.start(hi) - dst);
+            return;
+        }
+        // A subset: walk the term's pages to track bitstream positions, and
+        // coalesce wanted pages that are adjacent into one copy.
+        // Pending copy: (dst bit, src bit, page after the last one included).
+        let mut run: Option<(usize, usize, usize)> = None;
+        self.pages.for_each(|p| {
+            let lo = space.start(p);
+            if want.get(p) {
+                run = match run {
+                    Some((d, s, next)) if next == p => Some((d, s, p + 1)),
+                    Some((d, s, next)) => {
+                        copy_bits_or(data, s, out, d, space.start(next) - d);
+                        Some((lo, src, p + 1))
+                    }
+                    None => Some((lo, src, p + 1)),
+                };
+            }
+            src += space.start(p + 1) - lo;
+        });
+        if let Some((d, s, next)) = run {
+            copy_bits_or(data, s, out, d, space.start(next) - d);
         }
     }
 

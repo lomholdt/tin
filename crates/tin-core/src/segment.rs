@@ -261,6 +261,11 @@ impl Segment {
         cursor::for_each_tid(self.cursor(plan).as_mut(), &self.spaces, f);
     }
 
+    /// Append every match to `out`, in tid order.
+    pub fn collect(&self, plan: &Plan, out: &mut Vec<Tid>) {
+        cursor::collect_tids(self.cursor(plan).as_mut(), &self.spaces, out);
+    }
+
     pub fn count(&self, plan: &Plan) -> u64 {
         cursor::count(self.cursor(plan).as_mut(), &self.spaces)
     }

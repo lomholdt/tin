@@ -188,11 +188,16 @@ fn main() {
     }
 
     // Profiling hook: `TIN_PROFILE=conjunction` runs just that kind on TIN
-    // (single thread) and exits, for use under callgrind/perf.
+    // (single thread) and exits, for use under callgrind/perf. Add
+    // `TIN_PROFILE_MODE=tids` to materialize tids instead of counting.
     if let Ok(kind) = std::env::var("TIN_PROFILE") {
         let qs = QuerySet::generate(&index, args.per_kind, args.seed);
         let kind = Kind::ALL.into_iter().find(|k| k.name().eq_ignore_ascii_case(&kind)).expect("kind");
-        let n: u64 = qs.of(kind).map(|q| index.count(&q.plan)).sum();
+        let tids = std::env::var("TIN_PROFILE_MODE").is_ok_and(|m| m == "tids");
+        let n: u64 = qs
+            .of(kind)
+            .map(|q| if tids { index.search_vec(&q.plan).len() as u64 } else { index.count(&q.plan) })
+            .sum();
         eprintln!("profiled {} {} queries, {n} matches", args.per_kind, kind.name());
         return;
     }

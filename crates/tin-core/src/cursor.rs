@@ -29,17 +29,17 @@ use crate::tid::Tid;
 /// `start(p) .. start(p + 1)`, one per line pointer.
 #[derive(Copy, Clone)]
 pub struct GroupSpace<'a> {
-    /// 257 cumulative widths.
-    start: &'a [u32],
+    /// Cumulative widths.
+    start: &'a [u32; 257],
 }
 
 static EMPTY_SPACE: [u32; 257] = [0; 257];
 
 impl GroupSpace<'_> {
-    /// First bit of `page`.
+    /// First bit of `page` (`page` in `0..=256`; 256 = end of the group).
     #[inline]
     pub fn start(&self, page: usize) -> usize {
-        self.start[page] as usize
+        self.start[page.min(256)] as usize
     }
 
     #[inline]
@@ -62,19 +62,30 @@ impl GroupSpace<'_> {
     }
 
     /// Calls `f(page, offset_bit)` for every set bit of `bits`, ascending.
-    pub fn for_each_tuple(&self, bits: &[u64], mut f: impl FnMut(u8, u16)) {
-        let mut page = 0usize;
-        for (i, &word) in bits.iter().enumerate() {
-            let mut w = word;
-            while w != 0 {
-                let pos = (i * 64 + w.trailing_zeros() as usize) as u32;
-                while self.start[page + 1] <= pos {
-                    page += 1;
+    /// Only pages in `pages` are visited; `bits` must be zero elsewhere.
+    #[inline]
+    pub fn for_each_tuple(&self, bits: &[u64], pages: &PageBits, mut f: impl FnMut(u8, u16)) {
+        pages.for_each(|p| {
+            let (lo, hi) = (self.start(p), self.start(p + 1));
+            let mut base = lo;
+            while base < hi {
+                let n = (hi - base).min(64);
+                let (w, sh) = (base >> 6, base & 63);
+                let mut v = bits[w] >> sh;
+                if sh != 0 && sh + n > 64 {
+                    v |= bits[w + 1] << (64 - sh);
                 }
-                f(page as u8, (pos - self.start[page]) as u16);
-                w &= w - 1;
+                if n < 64 {
+                    v &= (1u64 << n) - 1;
+                }
+                let off = (base - lo) as u16;
+                while v != 0 {
+                    f(p as u8, off + v.trailing_zeros() as u16);
+                    v &= v - 1;
+                }
+                base += n;
             }
-        }
+        });
     }
 }
 
@@ -108,7 +119,7 @@ impl SpaceTable {
     pub fn group(&self, g: u32) -> GroupSpace<'_> {
         let i = g.wrapping_sub(self.first_group) as usize * 257;
         match self.starts.get(i..i + 257) {
-            Some(start) => GroupSpace { start },
+            Some(start) => GroupSpace { start: start.try_into().unwrap() },
             None => GroupSpace { start: &EMPTY_SPACE },
         }
     }
@@ -374,9 +385,13 @@ impl Cursor for AndNot<'_> {
     }
 }
 
-/// Evaluate `c` group by group, calling `f(group, space, bits)` with each
-/// non-empty group's exact tuple bitmap.
-fn drive(c: &mut dyn Cursor, spaces: &SpaceTable, mut f: impl FnMut(u32, &GroupSpace<'_>, &[u64])) {
+/// Evaluate `c` group by group, calling `f(group, space, pages, bits)` with
+/// each candidate group's exact tuple bitmap (`bits` is zero outside `pages`).
+fn drive(
+    c: &mut dyn Cursor,
+    spaces: &SpaceTable,
+    mut f: impl FnMut(u32, &GroupSpace<'_>, &PageBits, &[u64]),
+) {
     let mut buf: Vec<u64> = Vec::new();
     let mut g = 0;
     while let Some(cur) = c.seek(g) {
@@ -385,7 +400,7 @@ fn drive(c: &mut dyn Cursor, spaces: &SpaceTable, mut f: impl FnMut(u32, &GroupS
         buf.clear();
         buf.resize(space.words(), 0);
         c.or_into(&pages, &space, &mut buf);
-        f(cur, &space, &buf);
+        f(cur, &space, &pages, &buf);
         match cur.checked_add(1) {
             Some(next) => g = next,
             None => break,
@@ -395,14 +410,22 @@ fn drive(c: &mut dyn Cursor, spaces: &SpaceTable, mut f: impl FnMut(u32, &GroupS
 
 /// Drive a cursor to completion, calling `f` for every match in tid order.
 pub fn for_each_tid(c: &mut dyn Cursor, spaces: &SpaceTable, mut f: impl FnMut(Tid)) {
-    drive(c, spaces, |g, space, bits| {
-        space.for_each_tuple(bits, |page, bit| f(Tid::from_parts(g, page, bit)));
+    drive(c, spaces, |g, space, pages, bits| {
+        space.for_each_tuple(bits, pages, |page, bit| f(Tid::from_parts(g, page, bit)));
+    });
+}
+
+/// Append every match to `out`, in tid order.
+pub fn collect_tids(c: &mut dyn Cursor, spaces: &SpaceTable, out: &mut Vec<Tid>) {
+    drive(c, spaces, |g, space, pages, bits| {
+        out.reserve(bits.iter().map(|w| w.count_ones() as usize).sum());
+        space.for_each_tuple(bits, pages, |page, bit| out.push(Tid::from_parts(g, page, bit)));
     });
 }
 
 /// Count matches without materializing tids (POPCNT over tuple bitmaps).
 pub fn count(c: &mut dyn Cursor, spaces: &SpaceTable) -> u64 {
     let mut n = 0u64;
-    drive(c, spaces, |_, _, bits| n += bits.iter().map(|w| w.count_ones() as u64).sum::<u64>());
+    drive(c, spaces, |_, _, _, bits| n += bits.iter().map(|w| w.count_ones() as u64).sum::<u64>());
     n
 }

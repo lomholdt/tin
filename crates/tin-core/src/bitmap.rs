@@ -89,7 +89,7 @@ macro_rules! bitset {
             /// Maximal runs of set bits as `(lo, hi)` ranges, ascending.
             #[inline]
             pub fn runs(&self) -> Runs<$words> {
-                Runs { words: self.0, i: 0 }
+                Runs::new(self.0)
             }
 
             /// Set bit indexes, ascending.
@@ -156,9 +156,30 @@ macro_rules! bitset {
 }
 
 /// Iterator over the runs of set bits in a bitset; see `PageBits::runs`.
+///
+/// Run boundaries are computed word-parallel up front (`starts`: first bit of
+/// each run, `ends`: last bit of each run), so each run costs two
+/// trailing-zero counts regardless of its length.
 pub struct Runs<const W: usize> {
-    words: [u64; W],
-    i: usize,
+    starts: [u64; W],
+    ends: [u64; W],
+    ws: usize,
+    we: usize,
+}
+
+impl<const W: usize> Runs<W> {
+    #[inline]
+    fn new(words: [u64; W]) -> Self {
+        let mut starts = [0u64; W];
+        let mut ends = [0u64; W];
+        for i in 0..W {
+            let prev_top = if i > 0 { words[i - 1] >> 63 } else { 0 };
+            let next_bottom = if i + 1 < W { words[i + 1] << 63 } else { 0 };
+            starts[i] = words[i] & !((words[i] << 1) | prev_top);
+            ends[i] = words[i] & !((words[i] >> 1) | next_bottom);
+        }
+        Runs { starts, ends, ws: 0, we: 0 }
+    }
 }
 
 impl<const W: usize> Iterator for Runs<W> {
@@ -166,34 +187,21 @@ impl<const W: usize> Iterator for Runs<W> {
 
     #[inline]
     fn next(&mut self) -> Option<(usize, usize)> {
-        let bits = W * 64;
-        let mut i = self.i;
-        // Skip zeros.
-        loop {
-            if i >= bits {
-                self.i = i;
-                return None;
-            }
-            let w = self.words[i >> 6] >> (i & 63);
-            if w != 0 {
-                i += w.trailing_zeros() as usize;
-                break;
-            }
-            i = (i | 63) + 1;
+        while self.ws < W && self.starts[self.ws] == 0 {
+            self.ws += 1;
         }
-        let lo = i;
-        // Extend through ones.
-        loop {
-            let w = self.words[i >> 6] >> (i & 63);
-            let ones = (!w).trailing_zeros() as usize;
-            let room = 64 - (i & 63);
-            i += ones.min(room);
-            if ones < room || i >= bits {
-                break;
-            }
+        if self.ws == W {
+            return None;
         }
-        self.i = i;
-        Some((lo, i))
+        let lo = self.ws * 64 + self.starts[self.ws].trailing_zeros() as usize;
+        self.starts[self.ws] &= self.starts[self.ws] - 1;
+        // Every start has a matching end at or after it.
+        while self.ends[self.we] == 0 {
+            self.we += 1;
+        }
+        let hi = self.we * 64 + self.ends[self.we].trailing_zeros() as usize + 1;
+        self.ends[self.we] &= self.ends[self.we] - 1;
+        Some((lo, hi))
     }
 }
 
@@ -235,6 +243,31 @@ mod tests {
         assert_eq!((p.first(), p.last()), (Some(3), Some(255)));
         assert_eq!((PageBits::ZERO.first(), PageBits::ZERO.last()), (None, None));
         assert_eq!((!PageBits::ZERO).runs().collect::<Vec<_>>(), vec![(0, 256)]);
+
+        // Randomized: runs must tile exactly the set bits, maximally.
+        let mut seed = 42u64;
+        for _ in 0..2000 {
+            let mut b = PageBits::ZERO;
+            let density = (seed >> 60) as u32; // 0..16
+            for i in 0..256 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                if ((seed >> 33) as u32 % 16) < density {
+                    b.set(i);
+                }
+            }
+            let runs: Vec<_> = b.runs().collect();
+            let mut rebuilt = PageBits::ZERO;
+            for w in runs.windows(2) {
+                assert!(w[0].1 < w[1].0, "runs must be separated: {runs:?}");
+            }
+            for &(lo, hi) in &runs {
+                assert!(lo < hi);
+                for i in lo..hi {
+                    rebuilt.set(i);
+                }
+            }
+            assert_eq!(rebuilt, b);
+        }
         assert_eq!(PageBits::ZERO.runs().next(), None);
         assert_eq!(std::mem::align_of::<PageBits>(), 32);
     }

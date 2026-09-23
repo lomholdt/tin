@@ -86,6 +86,10 @@ Queries run **group at a time** over a tree of cursors (`Term`, `And`, `Or`, `An
    - `COUNT(*)` is a popcount over the result. Materializing tids walks the set bits.
 
 - 🔧 **Tuple space instead of one register per page.** ✅ TIN describes per-page 512-bit offset bitmaps processed with AVX-512. With ~13 tuples per page that is ~97% padding. We pack all of a group's pages end to end (~3,400 bits ≈ 53 words ≈ 7 AVX-512 registers), so one vector op covers ~39 pages. Because a term's consecutive pages are also contiguous on disk, a dense term fills the tuple space with a handful of straight bit copies (`copy_bits_or`), one per run of pages rather than one per page. Switching to this took disjunction COUNT p50 from 1.01 ms to 0.39 ms.
+- 🔧 **Finding runs word-parallel.** Run boundaries come from two masks, `starts = b & !(b << 1)` and `ends = b & !(b >> 1)` (with carries across words), so each run costs two trailing-zero counts.
+  - When a term's every page is wanted (OR, single terms), each run is one copy and the bitstream cursor just advances.
+  - When only a subset is wanted (AND/NOT masks), the reader walks the term's pages to track bitstream positions and coalesces adjacent wanted pages.
+  - Copies of ≤ 57 bits (a single ~13-tuple page) are one unaligned 8-byte load.
 - ✅ Bit operations are plain word loops on aligned arrays. With `-C target-cpu=native`, rustc emits AVX2/AVX-512 and `POPCNT`/`VPOPCNTQ`.
 
 ### Query language (Phase 0)

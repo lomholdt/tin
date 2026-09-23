@@ -18,7 +18,7 @@ The core idea: **postings are Postgres ctids stored as two-level bitmaps**, with
 | Correctness | 4,000 / 4,000 benchmark queries identical to an independent baseline; randomized differential tests (`cargo test`) |
 | Corpus | Super User Stack Exchange, 1.24M posts, 0.88 GB |
 | Index size | **19.4% of the text** (TIN post: "roughly 20%" for a minimal index) |
-| Speed (4 threads, COUNT) | 8.8k–17.6k queries/s, 1.2–1.9× an uncompressed in-RAM baseline; p99 ≈ 1 ms |
+| Speed (4 threads, COUNT) | 11k–22k queries/s, 1.5–2.4× an uncompressed in-RAM baseline; p99 ≈ 1.4 ms or better |
 
 The details, including where we deviate from the posts and why, are in:
 

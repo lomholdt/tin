@@ -140,6 +140,9 @@ fn random_queries_match_oracle() {
             for (i, idx) in indexes.iter().enumerate() {
                 let got = idx.search_vec(&plan);
                 assert_eq!(got, want, "seed {seed} query {q} index {i}: {plan:?}");
+                let mut streamed = Vec::new();
+                idx.search(&plan, |t| streamed.push(t));
+                assert_eq!(streamed, want, "streamed seed {seed} query {q}: {plan:?}");
                 assert_eq!(idx.count(&plan), want.len() as u64, "count seed {seed} query {q}: {plan:?}");
             }
         }

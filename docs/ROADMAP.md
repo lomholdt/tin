@@ -63,8 +63,8 @@ Built with **pgrx** (Rust), as a new `pg_tin` crate that depends on `tin-core`.
 
 ## Performance backlog (from Phase 0 profiling)
 
-- **Sparse lists**: decode with fixed-width bit-packed blocks (PFor-style) instead of varints. Varint decoding is still the top cost for AND over mid-frequency terms.
+- **Sparse lists**: decode with fixed-width bit-packed blocks (PFor-style) instead of varints. Varint decoding is still the top cost for AND over mid-frequency sparse terms.
 - **Cursors**: replace the boxed `dyn Cursor` tree with an enum, which removes per-group virtual calls.
-- **Materialization** (`all tids`): emit page by page instead of bit by bit.
+- **Materialization into a `Vec<Tid>`**: ~5 ns/tid (disjunction "all tids" 875 µs vs a 273 µs baseline). Revisit only if it shows up in the Postgres path, which emits per page into a `TIDBitmap`.
 - **Many-term OR**: a min-heap for 10+ children.
 - **Portability**: runtime SIMD dispatch (`is_x86_feature_detected!`) instead of `target-cpu=native`, so one extension binary runs everywhere.

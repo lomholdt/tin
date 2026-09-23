@@ -37,7 +37,7 @@ cargo run --release -p tin-bench -- data/superuser.docs.txt --queries-per-kind 1
 | | |
 |---|---|
 | Segments | 4 (built in parallel over disjoint block ranges) |
-| Build time | 12.21s (101,799 docs/s, 72.3 MB/s of text) |
+| Build time | 10.13s (122,655 docs/s, 87.1 MB/s of text) |
 | Postings (tuple, term) pairs | 87,850,352 |
 | Index size | 171.1 MB = dictionary 33.1 MB + postings 137.8 MB + page directory 188.4 KB |
 | Index / text | 19.4% |
@@ -76,31 +76,31 @@ Latency is single-threaded, one query at a time; QPS runs the whole set on 4 thr
 
 | Query kind | Mode | Engine | Avg matches | p50 | p99 | QPS |
 |---|---|---|---:|---:|---:|---:|
-| Conjunction | COUNT(*) | TIN | 1,043 | 118 µs | 789 µs | 17,591 |
-| Conjunction | all tids | TIN | 1,043 | 143 µs | 1.30 ms | 14,771 |
-| Conjunction | either | baseline | 1,043 | 107 µs | 2.70 ms | 12,022 |
-| Disjunction | COUNT(*) | TIN | 111,977 | 444 µs | 1.02 ms | 8,822 |
-| Disjunction | all tids | TIN | 111,977 | 1.20 ms | 3.14 ms | 2,748 |
-| Disjunction | either | baseline | 111,977 | 280 µs | 4.58 ms | 5,840 |
-| Mixed | COUNT(*) | TIN | 3,220 | 360 µs | 1.26 ms | 9,235 |
-| Mixed | all tids | TIN | 3,220 | 390 µs | 1.66 ms | 7,418 |
-| Mixed | either | baseline | 3,220 | 364 µs | 4.95 ms | 4,934 |
-| Negation | COUNT(*) | TIN | 1,566 | 235 µs | 1.02 ms | 11,724 |
-| Negation | all tids | TIN | 1,566 | 229 µs | 1.25 ms | 9,713 |
-| Negation | either | baseline | 1,566 | 176 µs | 3.36 ms | 9,503 |
-
+| Conjunction | COUNT(*) | TIN | 1,043 | 107 µs | 964 µs | 21,830 |
+| Conjunction | all tids | TIN | 1,043 | 109 µs | 1.55 ms | 16,600 |
+| Conjunction | either | baseline | 1,043 | 98 µs | 2.62 ms | 12,348 |
+| Disjunction | COUNT(*) | TIN | 111,977 | 289 µs | 681 µs | 10,980 |
+| Disjunction | all tids | TIN | 111,977 | 875 µs | 3.17 ms | 3,191 |
+| Disjunction | either | baseline | 111,977 | 273 µs | 4.13 ms | 6,691 |
+| Mixed | COUNT(*) | TIN | 3,220 | 197 µs | 1.10 ms | 11,703 |
+| Mixed | all tids | TIN | 3,220 | 265 µs | 1.90 ms | 8,616 |
+| Mixed | either | baseline | 3,220 | 331 µs | 4.72 ms | 4,987 |
+| Negation | COUNT(*) | TIN | 1,566 | 180 µs | 1.41 ms | 14,119 |
+| Negation | all tids | TIN | 1,566 | 185 µs | 1.56 ms | 11,526 |
+| Negation | either | baseline | 1,566 | 171 µs | 3.34 ms | 9,566 |
 
 ## Reading the numbers
 
 - **Correctness**: 4,000 / 4,000 queries return exactly the baseline's tids.
 - **Size**: 19.4% of the text, dictionary included. The TIN post puts a minimal index (no positions or frequencies) at "roughly 20% of the corpus", so we're in the same place.
   - Frequent terms cost 8.8 bits per posting, rare lists 27.6. TIN reports ~25 for rare.
-- **Throughput** (4 threads): TIN beats the uncompressed in-RAM baseline on every kind of COUNT query, by 1.2–1.9×.
-- **Tail latency**: p99 is better than the baseline everywhere: 3.3–4.5× for COUNT and 1.5–3× when materializing tids. Work per query is bounded by groups × pages, not by the length of the longest posting list.
+- **Throughput** (4 threads): TIN beats the uncompressed in-RAM baseline on every query kind and mode except "all tids" for disjunctions. For COUNT it's 1.5–2.4× faster.
+- **Tail latency**: p99 is better than the baseline everywhere: 2.4–6× for COUNT and 1.3–2.5× when materializing tids. Work per query is bounded by groups × pages, not by the length of the longest posting list.
 - **Median latency**:
-  - Conjunctions are within ~10% of the baseline, and mixed queries are level with it.
-  - Negations are slower at p50 (235 µs vs 176 µs), and so are disjunctions (444 µs vs 280 µs).
-  - Materializing all ~112k tids of a disjunction ("all tids") is the weakest spot, about 1.2 ms. That's per-tid emit cost, and it's on the backlog. In Postgres this path feeds a bitmap heap scan, and Phase 4's top-k avoids it entirely.
+  - Conjunctions and negations are within ~10% of the baseline.
+  - Mixed queries are 40% faster than it.
+  - Disjunction COUNT is level (289 µs vs 273 µs).
+  - The one clear loss: materializing all ~112k tids of a disjunction ("all tids", 875 µs vs 273 µs). That is per-tid emit cost into a Rust `Vec` (~5 ns/tid). In Postgres, results go page by page into a `TIDBitmap` instead, so Phase 1 measures the path that actually matters.
 - **Build**: 12 s for 1.24M docs on 4 threads, ~100k docs/s or 72 MB/s of text. TIN built 85 GB in 8m10s (~173 MB/s) on 8 vCPUs.
 
 **These numbers are not comparable to TIN's published figures.** Their tables measure end-to-end SQL against Postgres on 150M documents with disk I/O. Ours measure the engine alone, in memory, on a corpus about 1/100th the size. The comparison that matters comes in Phase 6, when the same query mix runs through Postgres against GIN and ParadeDB.
@@ -116,3 +116,5 @@ Every step was checked against the baseline on the full corpus and against the r
 | 3 | Evaluate a whole group as one packed tuple-space bitmap; copy runs of pages at once | Disjunction COUNT p50 1.01 ms → 0.39 ms, QPS 3.3k → 9.5k |
 | 4 | Precomputed group layouts; AND/NOT touch only the masked word range; skip tables on long sparse lists | Within noise (profiling showed the real cost was elsewhere) |
 | 5 | callgrind: ~70% of AND time was varint-decoding mid-frequency sparse lists → bias the encoder to bitmaps for lists > 64 | Conj p50 ~165 → 118 µs for +10% index size |
+| 6 | callgrind: OR/NOT spent ~70% in the run finder, because mid-frequency terms have many 1-page runs. Replaced with word-parallel run boundaries (start/end bitmasks, two `tzcnt` per run), a whole-run fast path when every page of the term is wanted, and a single 8-byte load for copies of ≤ 57 bits | Negation p50 235 → 180 µs; disjunction COUNT p50 444 → 289 µs, QPS 8.8k → 11.0k; mixed 360 → 197 µs |
+| 7 | Emit tids page by page (extract each page's bits in one go) instead of locating the page for every bit; reserve output per group | Disjunction "all tids" p50 1.20 → 0.88 ms |

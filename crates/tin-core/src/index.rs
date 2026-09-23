@@ -107,7 +107,9 @@ impl Index {
 
     pub fn search_vec(&self, plan: &Plan) -> Vec<Tid> {
         let mut v = Vec::new();
-        self.search(plan, |t| v.push(t));
+        for s in &self.segments {
+            s.collect(plan, &mut v);
+        }
         v
     }
 
