@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# .cargo/config.toml builds for the local CPU (target-cpu=native); CI restores
+# cached builds on runners with other CPUs, so build for the generic target.
+env:
+  RUSTFLAGS: ""
+
 jobs:
   test:
     runs-on: ubuntu-latest
