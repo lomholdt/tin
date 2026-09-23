@@ -125,7 +125,21 @@ SELECT count(*) FROM ids WHERE txt ==> '*07919*';
 RESET enable_seqscan;
 SELECT q, ids_same_as_seqscan(q) FROM unnest(ARRAY[
   'msku00*', '*79190*', '*4729*', 'msku0007919~', 'msku0007991~2', 'msku00* -*9*',
-  '(msku001* OR *4729*) msku*', '*0007*', 'msku1*']) q;
+  '(msku001* OR *4729*) msku*', '*0007*', 'msku1*', '*791*', 'msku00* -*791*', '*791* -*7919*']) q;
+-- Row estimates come from the index (exact for terms), so the search-box
+-- shape `==> q LIMIT k` uses the index when q is selective.
+CREATE FUNCTION est_rows(q text) RETURNS int LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+  EXECUTE format('EXPLAIN (FORMAT JSON) SELECT * FROM ids WHERE txt ==> %L', q) INTO j;
+  RETURN (j->0->'Plan'->>'Plan Rows')::int;
+END $$;
+SELECT q, est_rows(q) AS estimate, (SELECT count(*) FROM ids WHERE txt ==> q) AS actual
+  FROM unnest(ARRAY['msku0007919', 'nosuchterm', 'msku00079*', 'msku0007991~', '*07919*',
+                    'msku0007919 OR 000104729', 'msku00* -*9*']) q;
+EXPLAIN (costs off) SELECT id FROM ids WHERE txt ==> 'msku0007919* -msku0007919' LIMIT 9;
+EXPLAIN (costs off) SELECT id FROM ids WHERE txt ==> '*07919*' LIMIT 10;
+
 -- New rows go to the pending list; patterns must see them too.
 INSERT INTO ids (txt) VALUES ('MSKU7777777 999999999'), ('MRKU7777770 888888888');
 SELECT q, ids_same_as_seqscan(q) FROM unnest(ARRAY['*777777*', 'msku7777777~', 'mrku*', '*99999*']) q;

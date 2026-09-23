@@ -1,5 +1,5 @@
 -- Search functions + a timing harness. Needs pg_setup.sql and a `qs` table
--- (kind, q, target) loaded from queries.tsv. Writes pg_results.csv.
+-- (kind, q, target) loaded from queries.tsv. Writes pg_results.tsv.
 
 -- Plain Postgres, best effort, with Typesense's default semantics:
 --   1. exact + prefix matches (exact first), on the B-tree indexes;
@@ -36,11 +36,45 @@ BEGIN
   END LOOP;
 END $$;
 
--- tin today: exact identifiers only (prefix / fragment / typo arrive in Phase 4).
+-- tin, same tiers on one index (built WITH (grams = true)):
+--   1. exact, then prefix (`q* -q`);
+--   2. only if none: fragments (`*q*`, trigram candidates + recheck);
+--   3. only if still none: one typo (`q~`), then two (`q~2`, 7+ chars).
 CREATE OR REPLACE FUNCTION search_tin(q text, k int DEFAULT 10)
-RETURNS TABLE (id bigint, tier int) LANGUAGE sql AS $$
-  SELECT s.id, 0 FROM shipments s WHERE s.search_text ==> q LIMIT k
-$$;
+RETURNS TABLE (id bigint, tier int) LANGUAGE plpgsql AS $$
+DECLARE
+  t text := lower(btrim(q));
+  n int := 0;
+  m int;
+BEGIN
+  RETURN QUERY SELECT s.id, 0 FROM shipments s WHERE s.search_text ==> t LIMIT k;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  -- Patterns are single terms; anything else stays an exact search.
+  IF t !~ '^[[:alnum:]]+$' THEN RETURN; END IF;
+  IF n < k THEN
+    RETURN QUERY SELECT s.id, 1 FROM shipments s WHERE s.search_text ==> (t || '* -' || t) LIMIT k - n;
+    GET DIAGNOSTICS m = ROW_COUNT; n := n + m;
+  END IF;
+  IF n > 0 OR length(t) < 3 THEN RETURN; END IF;
+  RETURN QUERY SELECT s.id, 2 FROM shipments s WHERE s.search_text ==> ('*' || t || '*') LIMIT k;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n > 0 THEN RETURN; END IF;
+  RETURN QUERY SELECT s.id, 3 FROM shipments s WHERE s.search_text ==> (t || '~') LIMIT k;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n > 0 OR length(t) < 7 THEN RETURN; END IF;
+  RETURN QUERY SELECT s.id, 4 FROM shipments s WHERE s.search_text ==> (t || '~2') LIMIT k;
+END $$;
+
+-- psql -v engines=tin -v out=tin_results.tsv to run a subset.
+\if :{?engines}
+\else
+  \set engines 'tin,plain'
+\endif
+\if :{?out}
+\else
+  \set out 'pg_results.tsv'
+\endif
+SELECT set_config('bench.engines', :'engines', false) AS engines;
 
 CREATE TEMP TABLE res (engine text, kind text, q text, target bigint, ms float8, ids bigint[]);
 
@@ -49,7 +83,7 @@ DECLARE r record; t0 timestamptz; ids bigint[]; pass int; eng text;
 BEGIN
   SET LOCAL work_mem = '256MB';
   SET LOCAL max_parallel_workers_per_gather = 0;
-  FOREACH eng IN ARRAY ARRAY['tin', 'plain'] LOOP
+  FOREACH eng IN ARRAY string_to_array(current_setting('bench.engines'), ',') LOOP
     FOR pass IN 1..2 LOOP  -- pass 1 warms caches; keep pass 2
       DELETE FROM res WHERE engine = eng;
       -- plain-Postgres typo search takes seconds per query at 5M rows
@@ -67,7 +101,7 @@ BEGIN
   END LOOP;
 END $$;
 
-\copy (SELECT engine, kind, q, target, ms, array_to_string(ids, ' ') FROM res) TO 'pg_results.tsv' WITH (FORMAT text)
+COPY (SELECT engine, kind, q, target, ms, array_to_string(ids, ' ') FROM res) TO STDOUT \g :out
 SELECT engine, kind, round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ms)::numeric, 3) p50_ms,
        round(percentile_cont(0.99) WITHIN GROUP (ORDER BY ms)::numeric, 3) p99_ms,
        round(avg((target = ANY(ids))::int), 3) hit10

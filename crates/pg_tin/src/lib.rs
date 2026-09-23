@@ -17,6 +17,7 @@ mod build;
 mod options;
 mod pending;
 mod scan;
+mod selectivity;
 mod storage;
 mod write;
 
@@ -39,8 +40,10 @@ pub extern "C-unwind" fn _PG_init() {
 }
 
 /// `doc ==> query`: the non-index path (sequential scans, rechecks). Uses the
-/// same analyzer and query semantics as the index.
-#[pg_extern(immutable, parallel_safe, strict)]
+/// same analyzer and query semantics as the index. Analyzing each document
+/// costs roughly ten simple operators (0.4 µs a row on short identifiers),
+/// hence `cost = 10`.
+#[pg_extern(immutable, parallel_safe, strict, cost = 10)]
 fn tin_match(doc: &str, query: &str) -> bool {
     thread_local! {
         static LAST: std::cell::RefCell<Option<(String, tin_core::Plan)>> =
@@ -163,7 +166,7 @@ CREATE OPERATOR ==> (
     LEFTARG = text,
     RIGHTARG = text,
     FUNCTION = tin_match,
-    RESTRICT = contsel,
+    RESTRICT = tin_restrict,
     JOIN = contjoinsel
 );
 COMMENT ON OPERATOR ==> (text, text) IS 'full-text match: document ==> tin query';
@@ -172,7 +175,7 @@ CREATE OPERATOR CLASS text_tin_ops DEFAULT FOR TYPE text USING tin AS
     OPERATOR 1 ==> (text, text);
 "#,
     name = "tin_operator",
-    requires = [tin_match, tin_handler]
+    requires = [tin_match, tin_handler, tin_restrict]
 );
 
 #[pg_guard]

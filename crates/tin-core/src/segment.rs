@@ -18,14 +18,25 @@ use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 use rustc_hash::FxHashMap;
 
 use crate::cursor::{self, And, AndNot, Bits, Cursor, Empty, Or, SpaceTable};
-use crate::pattern::{self, Osa, GRAM_LEN, GRAM_MARK};
+use crate::pattern::{self, Osa, GRAM_MARK, GRAM_MIN_FRAGMENT};
 use crate::postings::{Encoder, Encoding, PageDir, TermPostings, TAIL_PADDING};
 use crate::query::Plan;
 use crate::tid::Tid;
 use crate::tokenize::Analyzer;
 
 const MAGIC: &[u8; 4] = b"TIN\0";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
+
+/// Terms [`Segment::estimate`] reads from a prefix or typo expansion before
+/// it stops counting (under-estimating, the safe side).
+pub const ESTIMATE_TERMS: usize = 1000;
+
+/// See [`Segment::fragment_terms`].
+const DENSE_GRAM_FACTOR: u64 = 10;
+
+/// Share of documents [`Segment::estimate`] assumes a fragment matches when
+/// there are no grams to consult.
+const FRAGMENT_GUESS: f64 = 1e-3;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
@@ -35,7 +46,8 @@ pub struct SegmentMeta {
     pub doc_count: u64,
     pub term_count: u64,
     pub posting_count: u64,
-    /// Terms' character trigrams are indexed too (for fragment search).
+    /// Terms' character 4-grams are indexed too (for fragment search; see
+    /// [`pattern`](crate::pattern)).
     pub grams: bool,
 }
 
@@ -103,7 +115,7 @@ impl SegmentBuilder {
         self.doc_count
     }
 
-    /// Also index each term's character trigrams, enabling fast
+    /// Also index each term's character 4-grams, enabling fast
     /// `*fragment*` search (at the cost of a bigger index).
     pub fn with_grams(mut self, on: bool) -> Self {
         self.grams = on;
@@ -409,19 +421,23 @@ impl Segment {
             },
             Plan::Prefix(p) => self.expand(self.dict.search(Str::new(p).starts_with()).into_stream()),
             Plan::Fuzzy(q, k) => self.expand(self.dict.search(Osa::new(q.as_bytes(), *k)).into_stream()),
-            Plan::Fragment(f) => {
-                if self.meta.grams && !negated && f.chars().count() >= GRAM_LEN {
-                    // Candidates: tuples with all of the fragment's trigrams
+            Plan::Fragment(f) => match (self.meta.grams, f.chars().count()) {
+                (true, GRAM_MIN_FRAGMENT) => {
+                    // Exact: the tuples with a gram starting with it.
+                    let p = pattern::fragment_gram_prefix(f);
+                    self.expand_filtered(self.dict.search(Str::new(&p).starts_with()).into_stream(), |_| true)
+                }
+                (true, len) if len > GRAM_MIN_FRAGMENT && !negated => {
+                    // Candidates: tuples with all of the fragment's grams
                     // (possibly spread over different terms); callers recheck.
-                    let mut grams_of = Vec::new();
-                    pattern::grams(f, |g| grams_of.push(Plan::Term(g.to_owned())));
-                    self.cursor_in(&Plan::And(grams_of), false)
-                } else {
+                    self.cursor_in(&Plan::And(self.fragment_terms(f)), false)
+                }
+                _ => {
                     // Exact: scan the dictionary.
                     let f = f.as_str();
-                    self.expand_filtered(self.dict.stream(), |t| t.contains(f))
+                    self.expand_filtered(self.dict.stream(), |t| !t.starts_with(GRAM_MARK) && t.contains(f))
                 }
-            }
+            },
             Plan::And(cs) => {
                 let mut kids = Vec::with_capacity(cs.len());
                 for c in cs {
@@ -459,15 +475,95 @@ impl Segment {
         }
     }
 
+    /// The grams `*f*`'s candidates are intersected from: those at most
+    /// [`DENSE_GRAM_FACTOR`] times as frequent as the rarest. Denser ones (an
+    /// owner code in a third of all rows) cost more to intersect than the
+    /// few candidates they would remove, which the recheck removes anyway.
+    fn fragment_terms(&self, f: &str) -> Vec<Plan> {
+        let mut grams = Vec::new();
+        pattern::fragment_grams(f, |g| {
+            grams.push((self.term(g).map_or(0, |tp| tp.doc_count()), g.to_owned()))
+        });
+        let rarest = grams.iter().map(|g| g.0).min().unwrap_or(0);
+        grams
+            .into_iter()
+            .filter(|(df, _)| *df <= rarest.saturating_mul(DENSE_GRAM_FACTOR))
+            .map(|(_, g)| Plan::Term(g))
+            .collect()
+    }
+
+    /// Estimated number of documents matching `plan` (ignoring liveness),
+    /// from dictionary statistics alone, for query planners: exact for single
+    /// terms; summed over matching terms for prefixes and typos (a lower
+    /// bound past [`ESTIMATE_TERMS`]); independence for fragments' grams
+    /// and for AND / OR / NOT. When unsure it errs low: an index scan on a
+    /// low estimate costs little, a sequential scan on a high one (planned
+    /// for `LIMIT k`, expecting matches everywhere) reads the whole table.
+    pub fn estimate(&self, plan: &Plan) -> f64 {
+        self.fraction(plan) * self.meta.doc_count as f64
+    }
+
+    fn fraction(&self, plan: &Plan) -> f64 {
+        let n = self.meta.doc_count.max(1) as f64;
+        let df = |t: &str| self.term(t).map_or(0, |tp| tp.doc_count());
+        let f = match plan {
+            Plan::Term(t) => df(t) as f64 / n,
+            Plan::Prefix(p) => {
+                self.sum_doc_counts(self.dict.search(Str::new(p).starts_with()).into_stream(), false) / n
+            }
+            Plan::Fuzzy(q, k) => {
+                self.sum_doc_counts(self.dict.search(Osa::new(q.as_bytes(), *k)).into_stream(), false) / n
+            }
+            Plan::Fragment(f) if self.meta.grams && f.chars().count() == GRAM_MIN_FRAGMENT => {
+                let p = pattern::fragment_gram_prefix(f);
+                self.sum_doc_counts(self.dict.search(Str::new(&p).starts_with()).into_stream(), true) / n
+            }
+            // As if the grams were independent. They overlap, so they aren't,
+            // and this under-estimates: the safe side (see above).
+            Plan::Fragment(f) if self.meta.grams && f.chars().count() > GRAM_MIN_FRAGMENT => {
+                let mut p = 1.0;
+                pattern::fragment_grams(f, |g| p *= df(g) as f64 / n);
+                p
+            }
+            // Answering this means scanning the dictionary; don't do it twice.
+            Plan::Fragment(_) => FRAGMENT_GUESS,
+            Plan::And(cs) => cs.iter().map(|c| self.fraction(c)).product(),
+            Plan::Or(cs) => 1.0 - cs.iter().map(|c| 1.0 - self.fraction(c)).product::<f64>(),
+            Plan::AndNot(p, q) => self.fraction(p) * (1.0 - self.fraction(q)),
+        };
+        f.clamp(0.0, 1.0)
+    }
+
+    /// Summed document frequency of the stream's gram terms (`grams`) or
+    /// other terms (fuzzy matching may meet grams, which don't count).
+    fn sum_doc_counts<S>(&self, mut stream: S, grams: bool) -> f64
+    where
+        S: for<'s> Streamer<'s, Item = (&'s [u8], u64)>,
+    {
+        let (mut sum, mut terms) = (0u64, 0usize);
+        while let Some((term, v)) = stream.next() {
+            if (term.first() == Some(&(GRAM_MARK as u8))) != grams {
+                continue;
+            }
+            sum += TermPostings::from_value(v, &self.postings).doc_count();
+            terms += 1;
+            if terms == ESTIMATE_TERMS {
+                break;
+            }
+        }
+        sum as f64
+    }
+
     /// Union of the postings of every (non-gram) term in `stream`, as one
     /// tuple-space bitmap.
     fn expand<'a, S>(&'a self, stream: S) -> Box<dyn Cursor + 'a>
     where
         S: for<'s> Streamer<'s, Item = (&'s [u8], u64)>,
     {
-        self.expand_filtered(stream, |_| true)
+        self.expand_filtered(stream, |t| !t.starts_with(GRAM_MARK))
     }
 
+    /// Union of the postings of the terms in `stream` that `keep` accepts.
     fn expand_filtered<'a, S>(&'a self, mut stream: S, keep: impl Fn(&str) -> bool) -> Box<dyn Cursor + 'a>
     where
         S: for<'s> Streamer<'s, Item = (&'s [u8], u64)>,
@@ -476,7 +572,7 @@ impl Segment {
         let mut any = false;
         while let Some((term, v)) = stream.next() {
             let Ok(term) = std::str::from_utf8(term) else { continue };
-            if term.starts_with(GRAM_MARK) || !keep(term) {
+            if !keep(term) {
                 continue;
             }
             any = true;

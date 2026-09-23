@@ -569,3 +569,45 @@ fn patterns_combined_with_other_conditions() {
     }
     assert!(nonempty > 300, "queries should mostly have matches ({nonempty})");
 }
+
+#[test]
+fn estimates_are_exact_for_terms_and_bound_patterns() {
+    let docs = id_corpus(95, 6000);
+    let mut rng = Rng(96);
+    let mut b = SegmentBuilder::new(0, u32::MAX).with_grams(true);
+    for (tid, ids) in &docs {
+        b.add(*tid, &ids.join(" "));
+    }
+    let seg = b.finish();
+    let mut a = Analyzer::new();
+    let est = |q: &str, a: &mut Analyzer| seg.estimate(&Plan::parse(q, a).unwrap());
+    let count = |q: &str, a: &mut Analyzer| {
+        let plan = Plan::parse(q, a).unwrap();
+        docs.iter().filter(|(_, ids)| plan.matches_text(&ids.join(" "), a)).count() as f64
+    };
+    assert_eq!(est("zzzz", &mut a), 0.0);
+    for _ in 0..200 {
+        let (_, ids) = &docs[rng.below(docs.len() as u64) as usize];
+        let id = &ids[rng.below(ids.len() as u64) as usize];
+        let (e, c) = (est(id, &mut a), count(id, &mut a));
+        assert!((e - c).abs() < 1e-6, "{id}: estimate {e}, count {c}");
+        // Summed over matching terms (and all of them: the corpus is small),
+        // so at least the true count.
+        for q in [format!("{}*", &id[..5]), format!("{id}~")] {
+            let (e, c) = (est(&q, &mut a), count(&q, &mut a));
+            assert!(e > c - 1e-6 && c >= 1.0, "{q}: estimate {e} < count {c}");
+        }
+        // Grams as if independent: positive, at most the rarest one.
+        let f = &id[id.len() - 5..];
+        let rarest = [&f[..4], &f[1..]].map(|g| seg.term(&format!("\u{1}{g}")).unwrap().doc_count());
+        let e = est(&format!("*{f}*"), &mut a);
+        assert!(e > 0.0 && e <= *rarest.iter().min().unwrap() as f64 + 1e-6, "*{f}*: {e} vs {rarest:?}");
+        // 3-char fragments are answered exactly from grams: summed over
+        // them, so at least the true count.
+        let f = format!("*{}*", &id[id.len() - 3..]);
+        let (e, c) = (est(&f, &mut a), count(&f, &mut a));
+        assert!(e > c - 1e-6, "{f}: estimate {e} < count {c}");
+        let (e, n) = (est(&format!("{id} -{id}"), &mut a), seg.meta().doc_count as f64);
+        assert!(e < 1.0 && e <= n, "{id} -{id}: {e}");
+    }
+}

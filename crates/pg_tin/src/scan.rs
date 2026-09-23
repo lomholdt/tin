@@ -197,6 +197,30 @@ pub unsafe extern "C-unwind" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *m
     n
 }
 
+/// Pending records [`selectivity`] evaluates; the rest are assumed alike.
+const PENDING_SAMPLE: usize = 1000;
+
+/// Planner estimate: the share of indexed tuples matching `plan`.
+pub unsafe fn selectivity(index: pg_sys::Relation, plan: &Plan) -> f64 {
+    let st = state(index);
+    let st = st.borrow();
+    let (mut docs, mut hits) = (0.0, 0.0);
+    for (_, seg, _) in &st.segments {
+        docs += seg.meta().doc_count as f64;
+        hits += seg.estimate(plan);
+    }
+    let sample = &st.pending[..st.pending.len().min(PENDING_SAMPLE)];
+    if !sample.is_empty() {
+        let matched = sample.iter().filter(|r| r.matches(plan)).count();
+        hits += matched as f64 * st.pending.len() as f64 / sample.len() as f64;
+        docs += st.pending.len() as f64;
+    }
+    if docs == 0.0 {
+        return 0.0;
+    }
+    (hits / docs).clamp(0.0, 1.0)
+}
+
 /// Totals for `tin_stats`.
 pub unsafe fn stats(index: pg_sys::Relation) -> (Meta, Vec<u64>) {
     let st = state(index);
