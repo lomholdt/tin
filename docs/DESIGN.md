@@ -104,6 +104,24 @@ Single-term patterns (Phase 4) combine with all of the above:
 | `*frag*` or `*frag` | contain `frag` | `*6018200*` |
 | `term~`, `term~2` | are within 1 (2) edits of `term` | `msku6012800~` |
 
+### Search box (Phase 5)
+
+`col ~> q` matches `q` the way a search box should; `col <~> q` ranks how well it matched (`tin_core::search`):
+
+| Rank | Some term of the row… | For query terms of |
+|---:|---|---|
+| 0 | equals it | any length |
+| 1 | starts with it | any length |
+| 2 | contains it | 3+ chars |
+| 3 | is 1 typo away | 4+ chars |
+| 4 | is 2 typos away | 7+ chars |
+
+- With several query terms, every term must match, and the worst one decides the rank.
+- `tin.search_typos` (0–2) drops typo ranks. Both the index and the per-row functions read it, so those functions are `STABLE`.
+- 🔧 **Ordered scans** (`tin_core::rank::Ranked`, `amgettuple`): rank 0, then 1, … Each rank is either streamed from the dictionary (single-term prefixes and typos, 32 terms at a time) or evaluated as a plan over each segment. Every row is returned once, at its first rank. Fragment candidates carry their rank as a lower bound (`xs_recheckorderby`), and the executor re-ranks them. Other conditions on the same scan are ANDed in, and rows matching those but no rank come last, at infinity.
+- 🔧 **Lazy DFA** for the typo automaton (`pattern::OsaDfa`): DP states are numbered as they are reached, and transitions per (state, byte class) are cached.
+- 🔧 **One segment after `CREATE INDEX`**: closed build segments are held while they fit in half of `maintenance_work_mem`, then merged, so dictionary walks touch one FST.
+
 ### Identifier patterns (Phase 4)
 
 - 🔧 **Prefix**: the FST's `starts_with` range. Every matching term's postings are ORed into one tuple-space bitmap per segment (the `Bits` cursor), which then behaves like any other cursor under AND/OR/NOT. Unique IDs are singletons stored in the dictionary value, so expansion reads no postings.
@@ -172,7 +190,7 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 - **Per-backend cache**, keyed by `(index OID, relfilenumber)`. REINDEX, TRUNCATE and VACUUM FULL change the relfilenumber, so a stale copy is never used. Under a shared metapage lock:
   - if the generation changed, the backend reloads every liveness bitmap and the whole pending list, and loads any segments it hasn't seen (segments are immutable and reused by id);
   - otherwise it reads only the new tail of the pending list.
-- **Bitmap scans only** (`amgetbitmap`, no `amgettuple`), like GIN. Several `==>` conditions are ANDed into one plan.
+- **Bitmap scans** (`amgetbitmap`) for `==>` and `~>`, and **ordered / plain index scans** (`amgettuple`, see [Search box](#search-box-phase-5)). Several conditions are ANDed into one plan.
   - Each segment is searched with its liveness bitmap, which is ANDed per 256-page group in the tuple space.
   - Pending records are matched directly.
   - Tids go to `tbm_add_tuples` **without recheck**, except for plans with gram-answered fragments (candidates, see above).

@@ -10,10 +10,10 @@ INSERT INTO docs (body)
   SELECT 'filler ' || i || CASE WHEN i % 7 = 0 THEN ' seven' ELSE '' END
                         || CASE WHEN i % 11 = 0 THEN ' eleven' ELSE '' END
   FROM generate_series(1, 20000) i;
-SET maintenance_work_mem = '1MB'; -- force several segments
+SET maintenance_work_mem = '64kB'; -- several segments while building, merged into one
 CREATE INDEX docs_body_tin ON docs USING tin (body);
 RESET maintenance_work_mem;
-SELECT count(*) > 1 AS several_segments, sum(bytes) > 0 AS has_data
+SELECT count(*) = 1 AS merged, sum(bytes) > 0 AS has_data
   FROM tin_segments('docs_body_tin'::regclass);
 SELECT * FROM tin_segments('docs'::regclass);
 
@@ -107,7 +107,10 @@ CREATE TABLE ids (id serial PRIMARY KEY, txt text);
 INSERT INTO ids (txt)
   SELECT 'MSKU' || lpad((i * 7919 % 10000000)::text, 7, '0') || ' ' || lpad((i * 104729 % 1000000000)::text, 9, '0')
   FROM generate_series(1, 20000) i;
+SET maintenance_work_mem = '1MB'; -- too small to hold them all for a merge: several segments
 CREATE INDEX ids_tin ON ids USING tin (txt) WITH (grams = true);
+RESET maintenance_work_mem;
+SELECT count(*) > 1 AS several_segments FROM tin_segments('ids_tin'::regclass);
 CREATE FUNCTION ids_same_as_seqscan(q text) RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE a int[]; b int[];
 BEGIN
@@ -146,6 +149,60 @@ SELECT q, ids_same_as_seqscan(q) FROM unnest(ARRAY['*777777*', 'msku7777777~', '
 SELECT tin_flush('ids_tin'::regclass) AS flushed;
 SELECT q, ids_same_as_seqscan(q) FROM unnest(ARRAY['*777777*', 'msku7777777~', 'mrku*', '*99999*']) q;
 SELECT 'x' ==> 'e-mail*';
+
+-- Ranked search box: `~>` matches, `<~>` ranks (0 exact, 1 prefix,
+-- 2 fragment, 3-4 typos), ORDER BY runs as an ordered index scan.
+INSERT INTO ids (txt) VALUES ('MSKU0007918 555555555'), ('XMSKU0007919 000000001');
+EXPLAIN (costs off) SELECT id FROM ids WHERE txt ~> 'msku0007919' ORDER BY txt <~> 'msku0007919' LIMIT 5;
+SELECT txt, txt <~> 'msku0007919' AS rank FROM ids
+  WHERE txt ~> 'msku0007919' ORDER BY txt <~> 'msku0007919', id LIMIT 6;
+SELECT txt, txt <~> 'msku00079' AS rank FROM ids
+  WHERE txt ~> 'msku00079' ORDER BY txt <~> 'msku00079', id LIMIT 4;
+-- Index order == ranks non-decreasing, and the same rows as a seqscan.
+CREATE FUNCTION ranked_ok(q text, filter text DEFAULT NULL) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE d float8[]; a int[]; b int[]; plan text := ''; line text;
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off;
+  IF filter IS NULL THEN
+    -- (Separate queries: an ORDER BY aggregate would sort the input.)
+    SELECT array_agg(r) INTO d FROM (SELECT txt <~> q r FROM ids WHERE txt ~> q ORDER BY txt <~> q LIMIT 100000) s;
+    SELECT array_agg(id ORDER BY id) INTO a FROM
+      (SELECT id FROM ids WHERE txt ~> q ORDER BY txt <~> q LIMIT 100000) s;
+    FOR line IN EXECUTE format('EXPLAIN (costs off) SELECT id FROM ids WHERE txt ~> %L ORDER BY txt <~> %L LIMIT 100000', q, q) LOOP
+      plan := plan || line;
+    END LOOP;
+  ELSE
+    -- (Separate queries: an ORDER BY aggregate would sort the input.)
+    SELECT array_agg(r) INTO d FROM (SELECT txt <~> q r FROM ids WHERE txt ==> filter ORDER BY txt <~> q LIMIT 100000) s;
+    SELECT array_agg(id ORDER BY id) INTO a FROM
+      (SELECT id FROM ids WHERE txt ==> filter ORDER BY txt <~> q LIMIT 100000) s;
+    FOR line IN EXECUTE format('EXPLAIN (costs off) SELECT id FROM ids WHERE txt ==> %L ORDER BY txt <~> %L LIMIT 100000', filter, q) LOOP
+      plan := plan || line;
+    END LOOP;
+  END IF;
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off; SET LOCAL enable_sort = on;
+  IF filter IS NULL THEN
+    SELECT array_agg(id ORDER BY id) INTO b FROM ids WHERE txt ~> q;
+  ELSE
+    SELECT array_agg(id ORDER BY id) INTO b FROM ids WHERE txt ==> filter;
+  END IF;
+  RETURN plan LIKE '%Index Scan using ids_tin%' AND a IS NOT DISTINCT FROM b
+     AND d IS NOT DISTINCT FROM (SELECT array_agg(x ORDER BY x) FROM unnest(d) x);
+END $$;
+SELECT q, filter, ranked_ok(q, filter) FROM (VALUES
+  ('msku0007919', NULL), ('msku00079', NULL), ('msku0', NULL), ('07919', NULL), ('msku0007991', NULL),
+  ('msku0007991x', NULL), ('msku0007919 000104729', NULL), ('msku00079 0001', NULL), ('ms', NULL),
+  ('nosuchthing', NULL), ('msku0007919', 'msku000*'), ('7919', '*791*')) v(q, filter);
+
+-- A typo budget (like Typesense's num_typos) drops typo tiers; index and
+-- seqscan agree under it too.
+SET tin.search_typos = 1;
+SELECT txt, txt <~> 'msku0007919' AS rank FROM ids
+  WHERE txt ~> 'msku0007919' ORDER BY txt <~> 'msku0007919', id LIMIT 6;
+SELECT q, ranked_ok(q) FROM unnest(ARRAY['msku0007919', 'msku0007991', 'msku0007991x']) q;
+SET tin.search_typos = 0;
+SELECT q, ranked_ok(q) FROM unnest(ARRAY['msku0007919', 'msku0007991']) q;
+RESET tin.search_typos;
 
 -- REINDEX compacts everything into fresh segments; cached copies must not be reused.
 REINDEX INDEX docs_body_tin;

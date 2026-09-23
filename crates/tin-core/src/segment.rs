@@ -18,7 +18,7 @@ use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 use rustc_hash::FxHashMap;
 
 use crate::cursor::{self, And, AndNot, Bits, Cursor, Empty, Or, SpaceTable};
-use crate::pattern::{self, Osa, GRAM_MARK, GRAM_MIN_FRAGMENT};
+use crate::pattern::{self, OsaDfa, GRAM_MARK, GRAM_MIN_FRAGMENT};
 use crate::postings::{Encoder, Encoding, PageDir, TermPostings, TAIL_PADDING};
 use crate::query::Plan;
 use crate::tid::Tid;
@@ -37,6 +37,27 @@ const DENSE_GRAM_FACTOR: u64 = 10;
 /// Share of documents [`Segment::estimate`] assumes a fragment matches when
 /// there are no grams to consult.
 const FRAGMENT_GUESS: f64 = 1e-3;
+
+/// The smallest key above every key starting with `p` (`None`: no bound).
+fn prefix_end(p: &[u8]) -> Option<Vec<u8>> {
+    let mut end = p.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xff {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// Terms for [`Segment::stream_terms`].
+#[derive(Copy, Clone, Debug)]
+pub enum TermFilter<'q> {
+    /// Terms starting with this.
+    Prefix(&'q str),
+    /// Terms within this many OSA edits.
+    Fuzzy(&'q str, u8),
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
@@ -420,7 +441,7 @@ impl Segment {
                 None => Box::new(Empty),
             },
             Plan::Prefix(p) => self.expand(self.dict.search(Str::new(p).starts_with()).into_stream()),
-            Plan::Fuzzy(q, k) => self.expand(self.dict.search(Osa::new(q.as_bytes(), *k)).into_stream()),
+            Plan::Fuzzy(q, k) => self.expand(self.dict.search(OsaDfa::new(q.as_bytes(), *k)).into_stream()),
             Plan::Fragment(f) => match (self.meta.grams, f.chars().count()) {
                 (true, GRAM_MIN_FRAGMENT) => {
                     // Exact: the tuples with a gram starting with it.
@@ -512,7 +533,7 @@ impl Segment {
                 self.sum_doc_counts(self.dict.search(Str::new(p).starts_with()).into_stream(), false) / n
             }
             Plan::Fuzzy(q, k) => {
-                self.sum_doc_counts(self.dict.search(Osa::new(q.as_bytes(), *k)).into_stream(), false) / n
+                self.sum_doc_counts(self.dict.search(OsaDfa::new(q.as_bytes(), *k)).into_stream(), false) / n
             }
             Plan::Fragment(f) if self.meta.grams && f.chars().count() == GRAM_MIN_FRAGMENT => {
                 let p = pattern::fragment_gram_prefix(f);
@@ -552,6 +573,78 @@ impl Segment {
             }
         }
         sum as f64
+    }
+
+    /// Calls `f` with the postings of up to `max` (non-gram) terms matching
+    /// `filter`, in term order, starting after the term `after`. Returns the
+    /// last term visited when it stopped at `max` (more may follow: pass it
+    /// back as `after`), `None` when there are no more. Lets a caller take
+    /// matches a few at a time and stop early, where [`search`](Self::search)
+    /// would expand every matching term first.
+    pub fn stream_terms(
+        &self,
+        filter: &TermFilter<'_>,
+        after: Option<&[u8]>,
+        max: usize,
+        f: impl FnMut(TermPostings<'_>),
+    ) -> Option<Vec<u8>> {
+        match *filter {
+            // A key range: cheaper per term than a `starts_with` automaton.
+            TermFilter::Prefix(p) => {
+                let b = self.dict.range();
+                let b = match after {
+                    Some(a) => b.gt(a),
+                    None => b.ge(p),
+                };
+                let b = match prefix_end(p.as_bytes()) {
+                    Some(end) => b.lt(end),
+                    None => b,
+                };
+                self.drain(b.into_stream(), max, f)
+            }
+            TermFilter::Fuzzy(q, k) => {
+                let b = self.dict.search(OsaDfa::new(q.as_bytes(), k));
+                let b = match after {
+                    Some(a) => b.gt(a),
+                    None => b,
+                };
+                self.drain(b.into_stream(), max, f)
+            }
+        }
+    }
+
+    fn drain<S>(&self, mut s: S, max: usize, mut f: impl FnMut(TermPostings<'_>)) -> Option<Vec<u8>>
+    where
+        S: for<'s> Streamer<'s, Item = (&'s [u8], u64)>,
+    {
+        let mut n = 0;
+        while let Some((term, v)) = s.next() {
+            if term.first() == Some(&(GRAM_MARK as u8)) {
+                continue;
+            }
+            f(TermPostings::from_value(v, &self.postings));
+            n += 1;
+            if n == max {
+                return Some(term.to_vec());
+            }
+        }
+        None
+    }
+
+    /// Calls `f` with each of `tp`'s tids that is set in `live` (all, if
+    /// `None`), in tid order.
+    pub fn for_each_posting(&self, tp: &TermPostings<'_>, live: Option<&[u64]>, mut f: impl FnMut(Tid)) {
+        match *tp {
+            TermPostings::Singleton(tid) => {
+                let alive = live.is_none_or(|l| {
+                    self.tid_bit(tid).is_some_and(|b| l[(b >> 6) as usize] >> (b & 63) & 1 == 1)
+                });
+                if alive {
+                    f(tid);
+                }
+            }
+            _ => cursor::for_each_tid(tp.cursor().as_mut(), &self.spaces, live, f),
+        }
     }
 
     /// Union of the postings of every (non-gram) term in `stream`, as one

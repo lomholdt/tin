@@ -16,7 +16,10 @@ use tin_core::{Analyzer, Plan, Segment, SegmentBuilder, Tid};
 
 /// Rows per heap page for these ~60-byte rows (5M rows in 66,672 pages).
 const ROWS_PER_PAGE: u32 = 75;
-const SEGMENTS: u32 = 3;
+/// Segments to build (`TIN_SEGMENTS`, default 3 like pg_tin's 5M build).
+fn segments_wanted() -> u32 {
+    std::env::var("TIN_SEGMENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
+}
 const K: usize = 10;
 
 fn main() {
@@ -27,7 +30,9 @@ fn main() {
 
     let tid = |i: u32| Tid::new(i / ROWS_PER_PAGE, (i % ROWS_PER_PAGE) as u16 + 1);
     let t = Instant::now();
-    let cache = |s: u32| format!("{dir}/tin-seg{s}.bin");
+    #[allow(non_snake_case)]
+    let SEGMENTS = segments_wanted();
+    let cache = |s: u32| format!("{dir}/tin-seg{SEGMENTS}-{s}.bin");
     let segments: Vec<Segment> = if std::path::Path::new(&cache(0)).exists() {
         // Built earlier (profilers run this far slower than native).
         (0..SEGMENTS).map(|s| Segment::from_bytes(&std::fs::read(cache(s)).unwrap()).unwrap()).collect()
@@ -56,9 +61,19 @@ fn main() {
         }
         segments
     };
+    // TIN_MERGE=1: time merging the segments into one.
+    let segments = if std::env::var("TIN_MERGE").is_ok() {
+        let t = Instant::now();
+        let inputs: Vec<(&Segment, Option<&[u64]>)> = segments.iter().map(|s| (s, None)).collect();
+        let merged = Segment::merge(&inputs).expect("non-empty");
+        eprintln!("merged {} segments in {:.1?}", segments.len(), t.elapsed());
+        vec![merged]
+    } else {
+        segments
+    };
     let bytes: usize = segments.iter().map(|s| s.size_bytes()).sum();
     let n: u64 = segments.iter().map(|s| s.meta().doc_count).sum();
-    eprintln!("{n} rows in {SEGMENTS} segments ({} MB), ready in {:.1?}", bytes >> 20, t.elapsed());
+    eprintln!("{n} rows in {} segments ({} MB), ready in {:.1?}", segments.len(), bytes >> 20, t.elapsed());
 
     // Row texts by tid, for rechecks.
     let texts: std::collections::HashMap<Tid, String> =
@@ -79,6 +94,43 @@ fn main() {
         })
         .filter(|(k, _)| only.as_ref().is_none_or(|o| o == k))
         .collect();
+
+    // TIN_FUZZY=1: time the typo automaton alone (k = 1 and 2) on every query.
+    if std::env::var("TIN_FUZZY").is_ok() {
+        for k in [1u8, 2] {
+            let mut v = Vec::new();
+            for (_, q) in &queries {
+                let t = q.trim().to_lowercase();
+                let t0 = Instant::now();
+                let mut n = 0;
+                for s in &segments {
+                    s.stream_terms(&tin_core::TermFilter::Fuzzy(&t, k), None, usize::MAX, |_| n += 1);
+                }
+                v.push(t0.elapsed());
+            }
+            v.sort();
+            println!("fuzzy k={k}: p50 {:?} p99 {:?}", v[v.len() / 2], v[v.len() * 99 / 100]);
+        }
+        // The same k = 2 passes, resumed every 4 terms.
+        let mut v = Vec::new();
+        for (_, q) in &queries {
+            let t = q.trim().to_lowercase();
+            let t0 = Instant::now();
+            for s in &segments {
+                let mut after: Option<Vec<u8>> = None;
+                loop {
+                    after = s.stream_terms(&tin_core::TermFilter::Fuzzy(&t, 2), after.as_deref(), 4, |_| ());
+                    if after.is_none() {
+                        break;
+                    }
+                }
+            }
+            v.push(t0.elapsed());
+        }
+        v.sort();
+        println!("fuzzy k=2 resumed every 4: p50 {:?} p99 {:?}", v[v.len() / 2], v[v.len() * 99 / 100]);
+        return;
+    }
 
     // (kind, tier) -> per-query (time, matches or candidates)
     let mut times: BTreeMap<(String, &str), Vec<(Duration, usize)>> = BTreeMap::new();

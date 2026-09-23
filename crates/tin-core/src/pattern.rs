@@ -159,6 +159,104 @@ impl Automaton for Osa {
     }
 }
 
+/// [`Osa`] as a lazily built DFA: each distinct DP state gets a number the
+/// first time it is reached, and each (state, byte class) transition is
+/// computed once, then read from a table. Following a dictionary edge is
+/// then a lookup instead of a DP row update; at k = 2 over 5M identifiers
+/// that is most of the work.
+///
+/// Bytes are grouped into classes: one per distinct query byte, one for all
+/// others. Transitions only compare bytes for equality with query bytes, so
+/// bytes of one class behave identically.
+pub struct OsaDfa {
+    osa: Osa,
+    class: [u8; 256],
+    /// A byte of each class (class 0: a byte not in the query).
+    repr: Vec<u8>,
+    cache: std::cell::RefCell<DfaCache>,
+}
+
+#[derive(Default)]
+struct DfaCache {
+    states: Vec<OsaState>,
+    ids: rustc_hash::FxHashMap<Vec<u8>, u32>,
+    /// `states.len() * repr.len()` transitions; `UNSET` until computed.
+    trans: Vec<u32>,
+    is_match: Vec<bool>,
+    can_match: Vec<bool>,
+}
+
+const UNSET: u32 = u32::MAX;
+
+impl OsaDfa {
+    pub fn new(query: &[u8], k: u8) -> Self {
+        let osa = Osa::new(query, k);
+        let mut class = [0u8; 256];
+        let mut repr = vec![(0..=255u8).find(|b| !osa.query.contains(b)).unwrap_or(0)];
+        for &b in &osa.query {
+            if class[b as usize] == 0 {
+                class[b as usize] = repr.len() as u8;
+                repr.push(b);
+            }
+        }
+        let dfa = OsaDfa { osa, class, repr, cache: Default::default() };
+        let start = dfa.osa.start();
+        dfa.intern(&mut dfa.cache.borrow_mut(), start);
+        dfa
+    }
+
+    fn intern(&self, c: &mut DfaCache, s: OsaState) -> u32 {
+        let n = self.osa.query.len() + 1;
+        let mut key = Vec::with_capacity(2 * n + 2);
+        key.extend_from_slice(&s.cur[..n]);
+        key.push(s.has_prev as u8);
+        if s.has_prev {
+            key.extend_from_slice(&s.prev[..n]);
+            key.push(self.class[s.last as usize]);
+        }
+        if let Some(&id) = c.ids.get(&key) {
+            return id;
+        }
+        let id = c.states.len() as u32;
+        c.is_match.push(self.osa.is_match(&s));
+        c.can_match.push(self.osa.can_match(&s));
+        c.states.push(s);
+        c.trans.resize(c.trans.len() + self.repr.len(), UNSET);
+        c.ids.insert(key, id);
+        id
+    }
+}
+
+impl Automaton for OsaDfa {
+    type State = u32;
+
+    fn start(&self) -> u32 {
+        0
+    }
+
+    fn is_match(&self, s: &u32) -> bool {
+        self.cache.borrow().is_match[*s as usize]
+    }
+
+    fn can_match(&self, s: &u32) -> bool {
+        self.cache.borrow().can_match[*s as usize]
+    }
+
+    fn accept(&self, s: &u32, b: u8) -> u32 {
+        let cls = self.class[b as usize] as usize;
+        let mut c = self.cache.borrow_mut();
+        let at = *s as usize * self.repr.len() + cls;
+        let t = c.trans[at];
+        if t != UNSET {
+            return t;
+        }
+        let next = self.osa.accept(&c.states[*s as usize], self.repr[cls]);
+        let t = self.intern(&mut c, next);
+        c.trans[at] = t;
+        t
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +310,12 @@ mod tests {
                 let d = osa(a.as_bytes(), b.as_bytes());
                 for k in 0..=2u8 {
                     assert_eq!(osa_within(a, b, k), d <= k as usize, "{a:?} vs {b:?} k={k} (d={d})");
+                    let dfa = OsaDfa::new(b.as_bytes(), k);
+                    let mut s = dfa.start();
+                    for &c in a.as_bytes() {
+                        s = dfa.accept(&s, c);
+                    }
+                    assert_eq!(dfa.is_match(&s), d <= k as usize, "dfa: {a:?} vs {b:?} k={k}");
                 }
             }
         }

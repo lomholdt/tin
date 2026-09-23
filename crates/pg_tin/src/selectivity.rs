@@ -9,11 +9,17 @@
 //! estimate comes from its segments (see `Segment::estimate`).
 
 use pgrx::prelude::*;
-use tin_core::{Analyzer, Plan};
+use tin_core::{Analyzer, Plan, SearchBox};
 
 /// For queries that aren't constants (generic plans) and columns without a
 /// tin index. Search-box queries are selective; assume so.
 const DEFAULT_SEL: f64 = 1e-4;
+
+/// Search-box tiers `~>` estimates count: exact, prefix, fragment.
+const ESTIMATE_TIERS: u8 = 2;
+
+/// Rows assumed within a few typos of a search-box query.
+const TYPO_ROWS: f64 = 20.0;
 
 /// `RESTRICT` estimator of `==>`.
 #[pg_extern(sql = "
@@ -23,6 +29,7 @@ CREATE FUNCTION tin_restrict(internal, oid, internal, integer) RETURNS float8
 fn tin_restrict(fcinfo: pg_sys::FunctionCallInfo) -> f64 {
     unsafe {
         let root = pgrx::fcinfo::pg_getarg_datum_raw(fcinfo, 0).cast_mut_ptr::<pg_sys::PlannerInfo>();
+        let operator = pg_sys::Oid::from(pgrx::fcinfo::pg_getarg_datum_raw(fcinfo, 1).value() as u32);
         let args = pgrx::fcinfo::pg_getarg_datum_raw(fcinfo, 2).cast_mut_ptr::<pg_sys::List>();
         let var_relid = pgrx::fcinfo::pg_getarg_datum_raw(fcinfo, 3).value() as i32;
         let mut vardata: pg_sys::VariableStatData = std::mem::zeroed();
@@ -32,7 +39,7 @@ fn tin_restrict(fcinfo: pg_sys::FunctionCallInfo) -> f64 {
         {
             return DEFAULT_SEL;
         }
-        let sel = if varonleft { estimate(&vardata, other) } else { None };
+        let sel = if varonleft { estimate(&vardata, other, operator) } else { None };
         // ReleaseVariableStats
         if !vardata.statsTuple.is_null() {
             if let Some(free) = vardata.freefunc {
@@ -43,7 +50,17 @@ fn tin_restrict(fcinfo: pg_sys::FunctionCallInfo) -> f64 {
     }
 }
 
-unsafe fn estimate(vardata: &pg_sys::VariableStatData, other: *mut pg_sys::Node) -> Option<f64> {
+/// Whether `operator` is `~>` (else `==>`).
+unsafe fn is_search(operator: pg_sys::Oid) -> bool {
+    let name = pg_sys::get_opname(operator);
+    !name.is_null() && std::ffi::CStr::from_ptr(name).to_bytes() == b"~>"
+}
+
+unsafe fn estimate(
+    vardata: &pg_sys::VariableStatData,
+    other: *mut pg_sys::Node,
+    operator: pg_sys::Oid,
+) -> Option<f64> {
     if other.is_null() || (*other).type_ != pg_sys::NodeTag::T_Const {
         return None;
     }
@@ -53,7 +70,19 @@ unsafe fn estimate(vardata: &pg_sys::VariableStatData, other: *mut pg_sys::Node)
     }
     // Invalid queries fail at execution, with a proper message.
     let query = String::from_datum((*c).constvalue, false)?;
-    let plan = Plan::parse(&query, &mut Analyzer::new()).ok()?;
+    let (plan, extra_rows) = if is_search(operator) {
+        // Typo tiers aren't walked (a 2-typo automaton over the dictionaries
+        // cost ~10 ms per plan); they get a flat allowance instead. It
+        // matters: Postgres costs one index path for both the ordered scan
+        // and the bitmap scan, so only a row estimate above the LIMIT lets
+        // it see that `ORDER BY col <~> q LIMIT k` stops early, while a
+        // bitmap scan must evaluate every typo tier in full.
+        let sb = SearchBox::parse(&query, &mut Analyzer::new());
+        let typos = if sb.has_tier(3) { TYPO_ROWS } else { 0.0 };
+        (sb.plan(ESTIMATE_TIERS), typos)
+    } else {
+        (Plan::parse(&query, &mut Analyzer::new()).ok()?, 0.0)
+    };
     let rel = vardata.rel;
     if rel.is_null() {
         return None;
@@ -65,7 +94,7 @@ unsafe fn estimate(vardata: &pg_sys::VariableStatData, other: *mut pg_sys::Node)
         }
         // The planner already holds a lock on the table's indexes.
         let index = pg_sys::index_open((*info).indexoid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-        let sel = crate::scan::selectivity(index, &plan);
+        let sel = crate::scan::selectivity(index, &plan, extra_rows);
         pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         return Some(sel);
     }

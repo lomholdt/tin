@@ -611,3 +611,115 @@ fn estimates_are_exact_for_terms_and_bound_patterns() {
         assert!(e < 1.0 && e <= n, "{id} -{id}: {e}");
     }
 }
+
+#[test]
+fn ranked_search_box_matches_brute_force() {
+    use tin_core::rank::{PendingDoc, Ranked, Sources, NO_TIER};
+    use tin_core::{SearchBox, SortedTerms};
+
+    let docs = id_corpus(97, 6000);
+    let mut rng = Rng(98);
+    // Two segments over disjoint blocks, the last 300 docs pending.
+    let (indexed, pending) = docs.split_at(docs.len() - 300);
+    let cut = indexed.len() / 2;
+    let seg_of = |part: &[(Tid, Vec<String>)]| {
+        let mut b = SegmentBuilder::new(part[0].0.block, part[part.len() - 1].0.block + 1).with_grams(true);
+        for (tid, ids) in part {
+            b.add(*tid, &ids.join(" "));
+        }
+        b.finish()
+    };
+    let segs = [seg_of(&indexed[..cut]), seg_of(&indexed[cut..])];
+    // Delete ~10% of indexed tuples.
+    let dead: BTreeSet<Tid> = indexed.iter().filter(|_| rng.chance(0.1)).map(|(t, _)| *t).collect();
+    let lives: Vec<Vec<u64>> = segs
+        .iter()
+        .map(|s| {
+            let mut l = s.docs().to_vec();
+            for t in &dead {
+                if let Some(b) = s.tid_bit(*t) {
+                    l[(b >> 6) as usize] &= !(1 << (b & 63));
+                }
+            }
+            l
+        })
+        .collect();
+    let mut a = Analyzer::new();
+    let pending_docs: Vec<PendingDoc> = pending
+        .iter()
+        .map(|(t, ids)| PendingDoc { tid: *t, terms: a.unique_terms(&ids.join(" ")) })
+        .collect();
+    let src = Sources {
+        segments: segs.iter().zip(&lives).map(|(s, l)| (s, Some(l.as_slice()))).collect(),
+        pending: &pending_docs,
+    };
+    let live_docs: Vec<(Tid, Vec<String>)> = docs
+        .iter()
+        .filter(|(t, _)| !dead.contains(t))
+        .map(|(t, ids)| (*t, a.unique_terms(&ids.join(" "))))
+        .collect();
+
+    let mut streamed = 0;
+    for q in 0..300 {
+        let (_, ids) = &docs[rng.below(docs.len() as u64) as usize];
+        let id = ids[0].clone();
+        let other = &docs[rng.below(docs.len() as u64) as usize].1[0];
+        let text = match q % 7 {
+            0 => id.clone(),
+            1 => id[..3 + rng.below(4) as usize].to_owned(),
+            2 => id[id.len() - 5..].to_owned(),
+            3 => {
+                let mut t = id.clone().into_bytes();
+                let i = rng.below(t.len() as u64 - 1) as usize;
+                t.swap(i, i + 1);
+                String::from_utf8(t).unwrap()
+            }
+            4 => format!("{}x", &id[..id.len() - 1]),
+            5 => format!("{} {}", &id[..4], other),
+            _ => id[..2].to_owned(),
+        };
+        let query = SearchBox::parse(&text, &mut a).with_max_typos((q / 3 % 3) as u8);
+        let filter = (q % 3 == 0).then(|| Plan::parse(&format!("{}*", &other[..2]), &mut a).unwrap());
+        streamed += (filter.is_none() && query.terms().len() == 1) as usize;
+
+        let mut r = Ranked::new(query.clone(), filter.clone());
+        let mut seen = BTreeSet::new();
+        let mut got = BTreeSet::new();
+        let mut last_bound = 0;
+        let terms_of: std::collections::HashMap<Tid, &Vec<String>> =
+            live_docs.iter().map(|(t, v)| (*t, v)).collect();
+        while let Some(h) = r.next(&src) {
+            assert!(seen.insert(h.tid), "{text:?}: {:?} twice", h.tid);
+            assert!(h.tier >= last_bound, "{text:?}: tiers out of order");
+            last_bound = h.tier;
+            let terms =
+                terms_of.get(&h.tid).unwrap_or_else(|| panic!("{text:?}: dead or unknown {:?}", h.tid));
+            let true_tier = query.tier_of_terms(terms).unwrap_or(NO_TIER);
+            let passes = filter.as_ref().is_none_or(|f| f.matches(&SortedTerms(terms)))
+                && (filter.is_some() || true_tier < NO_TIER);
+            if !h.recheck {
+                assert!(passes, "{text:?}: {:?} doesn't match", h.tid);
+            }
+            // Any tier but the true one must be flagged as a lower bound, so
+            // the executor recomputes it.
+            if h.tier_is_bound {
+                assert!(h.tier <= true_tier, "{text:?}: bound {} > tier {true_tier}", h.tier);
+            } else {
+                assert_eq!(h.tier, true_tier, "{text:?}: {:?}", h.tid);
+            }
+            if passes {
+                got.insert(h.tid);
+            }
+        }
+        let want: BTreeSet<Tid> = live_docs
+            .iter()
+            .filter(|(_, terms)| match &filter {
+                Some(f) => f.matches(&SortedTerms(terms)),
+                None => query.tier_of_terms(terms).is_some(),
+            })
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(got, want, "{text:?} filter {filter:?}");
+    }
+    assert!(streamed > 100);
+}

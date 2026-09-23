@@ -172,3 +172,79 @@ Same machine, data, queries and timing as above. **tin** now runs the same searc
 5. **Allocation-free typo automaton**: fixed-size DP rows took the typo tier from 0.81 to 0.63 ms (tin-core).
 
 Profile any of this without Postgres with `cargo run --release -p tin-bench --bin ids -- DATA_DIR`. It builds the same segments, runs the same tiers, and prints per-tier latency and candidate counts.
+
+## Phase 5: ranked search box
+
+tin is now one query, answered by an **ordered index scan**:
+
+```sql
+SELECT id FROM shipments
+WHERE search_text ~> $1 ORDER BY search_text <~> $1 LIMIT 10;
+```
+
+`<~>` is the rank: 0 exact, 1 prefix, 2 fragment, 3 one typo, 4 two typos. The index produces rows tier by tier, streams prefix and typo matches from the dictionary a few terms at a time, and stops when the executor has 10 rows.
+
+- **tin**: typo budget 2 (`tin.search_typos`, the default).
+- **tin1**: budget 1 (`SET tin.search_typos = 1`, like Typesense's `num_typos = 1`).
+
+| Query kind | Engine | p50 | p99 | hit@1 | hit@10 | precision@10 | empty |
+|---|---|---:|---:|---:|---:|---:|---:|
+| bl_digits | plain | 15.61 ms | 21.76 ms | 52.6% | 99.8% | 100.0% | 0.0% |
+| bl_digits | tin | 4.11 ms | 5.83 ms | 52.6% | 100.0% | 25.5% | 0.0% |
+| bl_digits | tin1 | 0.84 ms | 1.46 ms | 52.6% | 100.0% | 89.5% | 0.0% |
+| bl_digits | typesense | 8.08 ms | 14.98 ms | 0.1% | 0.3% | 0.5% | 0.0% |
+| equipment_digits | plain | 11.82 ms | 16.77 ms | 36.8% | 76.4% | 100.0% | 0.0% |
+| equipment_digits | tin | 3.58 ms | 5.81 ms | 36.8% | 98.4% | 50.2% | 0.0% |
+| equipment_digits | tin1 | 0.63 ms | 1.29 ms | 36.8% | 98.4% | 100.0% | 0.0% |
+| equipment_digits | typesense | 1.94 ms | 5.40 ms | 0.0% | 0.0% | 25.5% | 0.0% |
+| equipment_suffix | plain | 0.22 ms | 9.68 ms | 0.1% | 0.1% | 100.0% | 0.0% |
+| equipment_suffix | tin | 0.09 ms | 0.78 ms | 0.1% | 0.1% | 100.0% | 0.0% |
+| equipment_suffix | tin1 | 0.12 ms | 0.53 ms | 0.1% | 0.1% | 100.0% | 0.0% |
+| equipment_suffix | typesense | 0.96 ms | 2.02 ms | 0.0% | 0.0% | 79.8% | 0.0% |
+| exact_bl | plain | 0.11 ms | 0.21 ms | 52.8% | 100.0% | 100.0% | 0.0% |
+| exact_bl | tin | 3.95 ms | 6.59 ms | 52.8% | 100.0% | 46.1% | 0.0% |
+| exact_bl | tin1 | 1.27 ms | 2.00 ms | 52.8% | 100.0% | 97.3% | 0.0% |
+| exact_bl | typesense | 0.73 ms | 1.31 ms | 56.6% | 100.0% | 100.0% | 0.0% |
+| exact_booking | plain | 0.11 ms | 0.26 ms | 52.8% | 100.0% | 100.0% | 0.0% |
+| exact_booking | tin | 4.02 ms | 6.12 ms | 52.8% | 100.0% | 24.0% | 0.0% |
+| exact_booking | tin1 | 0.94 ms | 1.96 ms | 52.8% | 100.0% | 87.8% | 0.0% |
+| exact_booking | typesense | 0.66 ms | 1.14 ms | 56.6% | 100.0% | 100.0% | 0.0% |
+| exact_equipment | plain | 0.09 ms | 0.24 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| exact_equipment | tin | 2.03 ms | 3.89 ms | 100.0% | 100.0% | 10.1% | 0.0% |
+| exact_equipment | tin1 | 0.88 ms | 1.65 ms | 100.0% | 100.0% | 91.2% | 0.0% |
+| exact_equipment | typesense | 0.67 ms | 1.53 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| exact_equipment_lower | plain | 0.09 ms | 0.22 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| exact_equipment_lower | tin | 2.06 ms | 3.82 ms | 100.0% | 100.0% | 10.1% | 0.0% |
+| exact_equipment_lower | tin1 | 0.91 ms | 1.80 ms | 100.0% | 100.0% | 91.2% | 0.0% |
+| exact_equipment_lower | typesense | 0.68 ms | 1.83 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| prefix_bl | plain | 0.30 ms | 74.27 ms | 21.9% | 51.6% | 100.0% | 0.0% |
+| prefix_bl | tin | 0.40 ms | 5.06 ms | 21.2% | 52.7% | 75.2% | 0.0% |
+| prefix_bl | tin1 | 0.53 ms | 1.73 ms | 21.2% | 52.7% | 94.2% | 0.0% |
+| prefix_bl | typesense | 0.83 ms | 1.53 ms | 22.7% | 51.8% | 100.0% | 0.0% |
+| prefix_equipment | plain | 0.75 ms | 552.65 ms | 22.5% | 35.8% | 100.0% | 0.0% |
+| prefix_equipment | tin | 0.23 ms | 2.57 ms | 22.2% | 37.1% | 78.4% | 0.0% |
+| prefix_equipment | tin1 | 0.27 ms | 1.55 ms | 22.2% | 37.1% | 94.5% | 0.0% |
+| prefix_equipment | typesense | 0.78 ms | 1.25 ms | 23.1% | 30.9% | 100.0% | 0.0% |
+| typo_equipment | plain | 1193.44 ms | 7979.04 ms | 33.3% | 82.5% | 27.5% | 0.0% |
+| typo_equipment | tin | 1.92 ms | 4.32 ms | 57.6% | 100.0% | 23.8% | 0.0% |
+| typo_equipment | tin1 | 0.93 ms | 1.83 ms | 57.6% | 100.0% | 99.4% | 0.0% |
+| typo_equipment | typesense | 1.53 ms | 3.54 ms | 47.9% | 83.4% | 82.0% | 0.0% |
+
+**Reading it**
+
+- **Every kind, every percentile, under 7 ms (tin) or 2 ms (tin1).** The short-prefix p99 that was 163 ms (Phase 4) and 553 ms (plain) is now 1.5–2.6 ms.
+- **Recall is the best of the three.**
+  - Fragments: 98.4–100% hit@10. Phase 4's fallback search found 76.4%, because it gave up on typos once any fragment matched.
+  - Typos: 100% hit@10, 57.6% hit@1 (Typesense: 83.4% / 47.9%).
+- **Why exact is slower than a B-tree (0.9 ms vs 0.1 ms)**: `ORDER BY … LIMIT 10` asks for the ten *best* rows. When one row matches exactly, the other nine come from the typo tiers, and finding them means walking the dictionary. Plain Postgres and Typesense return just the one row.
+  - That's also why tin's precision@10 is lower with budget 2: rows two typos away don't count as relevant in this metric.
+  - With budget 1 the filler is at most one typo away: 88–99% precision.
+- Latency is in-server; Typesense's is client time, about 0.5 ms of which is HTTP.
+
+**How we got here**
+
+1. **Ordered scans** (`amgettuple` + `amcanorderbyop`), and tiers produced lazily (`tin_core::rank::Ranked`). Checked against brute force with deleted rows, pending rows and extra conditions, and against sequential scans in SQL.
+2. **Resuming dictionary streams**: prefixes resume from a key range, so a batch of 32 terms costs microseconds.
+3. **Typo automaton → lazy DFA**: each DP state is computed once, and after that a transition is a table lookup. That halved the 2-typo walk (12 → 6 ms for 13-character B/Ls).
+4. **One segment after `CREATE INDEX`**: the build keeps its segments in memory, up to half of `maintenance_work_mem`, and merges them at the end. Every dictionary walk then touches one FST instead of three, making typo walks 2–2.7× faster. The merge adds 14 s to the 5M build (91 → 103 s).
+5. **Planner**: Postgres costs one index path for both the ordered and the bitmap scan. So the `~>` row estimate has to exceed the LIMIT before the planner sees that an ordered scan stops early. The estimate now includes a flat allowance of 20 rows for queries with typo tiers.

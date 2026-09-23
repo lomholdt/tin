@@ -6,12 +6,17 @@
 //! report a root offset after higher offsets, so each block's tuples are
 //! buffered and sorted before they reach the segment builder. A segment is
 //! closed at a block boundary once its builder outgrows
-//! `maintenance_work_mem`, written to index pages, and dropped, so memory
-//! stays bounded however large the table is.
+//! `maintenance_work_mem`.
+//!
+//! Closed segments are held in memory while they fit in half of
+//! `maintenance_work_mem`, and merged into one at the end: every dictionary
+//! walk (prefixes, typos) then touches one FST instead of several, which
+//! halved typo search at 5M rows. Past that they are written out as they
+//! close, so memory stays bounded however large the table is.
 
 use pgrx::prelude::*;
 use pgrx::PgMemoryContexts;
-use tin_core::{SegmentBuilder, Tid};
+use tin_core::{Segment, SegmentBuilder, Tid};
 
 use crate::storage::{self, Meta, SegmentRef, MAX_SEGMENTS};
 
@@ -24,6 +29,11 @@ struct BuildState {
     builder: SegmentBuilder,
     grams: bool,
     segments: Vec<SegmentRef>,
+    /// Closed segments not written yet (to merge at the end), and their size.
+    held: Vec<Segment>,
+    held_bytes: usize,
+    /// Segments are written as they close (too many to merge in memory).
+    spilled: bool,
     budget: usize,
     tuples: u64,
 }
@@ -48,12 +58,42 @@ impl BuildState {
         if builder.doc_count() == 0 {
             return;
         }
+        let seg = builder.finish();
+        if self.spilled {
+            return self.write_segment(&seg);
+        }
+        self.held_bytes += seg.size_bytes();
+        self.held.push(seg);
+        if self.held_bytes > self.budget / 2 {
+            self.spill();
+        }
+    }
+
+    unsafe fn spill(&mut self) {
+        for seg in std::mem::take(&mut self.held) {
+            self.write_segment(&seg);
+        }
+        self.spilled = true;
+    }
+
+    /// Write what is held: merged into one segment if there are several.
+    unsafe fn finish(&mut self) {
+        if self.held.len() > 1 {
+            let inputs: Vec<(&Segment, Option<&[u64]>)> = self.held.iter().map(|s| (s, None)).collect();
+            let merged = Segment::merge(&inputs).expect("held segments have documents");
+            self.held.clear();
+            self.write_segment(&merged);
+        } else {
+            self.spill();
+        }
+    }
+
+    unsafe fn write_segment(&mut self, seg: &Segment) {
         if self.segments.len() == MAX_SEGMENTS {
             error!(
                 "tin: index needs more than {MAX_SEGMENTS} segments; raise maintenance_work_mem and retry"
             );
         }
-        let seg = builder.finish();
         let bytes = seg.to_bytes();
         let (first_block, n_blocks) = storage::write_blob(self.index, &bytes, false);
         let (live_first, live_blocks) =
@@ -113,6 +153,9 @@ pub unsafe extern "C-unwind" fn ambuild(
         builder: SegmentBuilder::open_ended(0).with_grams(crate::options::grams(index)),
         grams: crate::options::grams(index),
         segments: Vec::new(),
+        held: Vec::new(),
+        held_bytes: 0,
+        spilled: false,
         budget: (pg_sys::maintenance_work_mem as usize) * 1024,
         tuples: 0,
     };
@@ -133,6 +176,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     );
     state.flush_page();
     state.finish_segment(0);
+    state.finish();
 
     let mut meta = Meta::empty();
     meta.next_segment_id = state.segments.len() as u32;

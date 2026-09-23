@@ -28,9 +28,9 @@ Long-text ranking (BM25, phrases) and TIN-style big-corpus benchmarks still matt
 | 2 | **Writes** | INSERT / UPDATE / DELETE / VACUUM correct under concurrency and after `kill -9`; index = seqscan | ✅ done |
 | 3 | **Identifier dataset + baselines** | 5M synthetic container / booking / B/L numbers; B-tree + `pg_trgm` (+ Typesense) latency and recall measured | ✅ done ([results](BENCHMARKS-IDS.md)) |
 | 4 | **Prefix, typo, fragment matching** | `msku12*`, `msku1243565~`, and fragment search each match a brute-force reference on 5M IDs | ✅ done ([results](BENCHMARKS-IDS.md#phase-4-prefix-typo-and-fragment-matching)) |
-| 5 | **Ranked top-k** | `ORDER BY col <=> 'q' LIMIT 20` through an ordered index scan that stops early; search-box p99 < 10 ms at 5M rows | next |
-| 6 | **Identifier benchmark** | tin vs B-tree + `pg_trgm` vs Typesense: latency, recall@10, build time, size; **update storm** (700k updates/day, incl. the same rows over and over) | |
-| 7 | Merges + zero-copy reads | Background merging of small segments; segments read straight from shared buffers, no per-backend copy | |
+| 5 | **Ranked top-k** | `ORDER BY col <~> 'q' LIMIT 10` through an ordered index scan that stops early; search-box p99 < 10 ms at 5M rows | ✅ done ([results](BENCHMARKS-IDS.md#phase-5-ranked-search-box)) |
+| 6 | **Identifier benchmark** | tin vs B-tree + `pg_trgm` vs Typesense: latency, recall@10, build time, size; **update storm** (700k updates/day, incl. the same rows over and over) | next |
+| 7 | Zero-copy reads, parallel build, background merges | No ~1 s index copy on a backend's first query; `CREATE INDEX` on all cores; merges off the insert path | moved up: right after 6 |
 | 8 | Long text | BM25 top-k, phrases, visibility-map `COUNT(*)`, big-corpus benchmark vs GIN / ParadeDB | |
 
 ## Phase 1: Postgres index access method ✅
@@ -78,11 +78,14 @@ At 5M rows, in Postgres:
 
 **Carried into Phase 5**: short prefixes (p99 163 ms). A bitmap scan must produce every match before `LIMIT` applies, and `MSKU6*` matches ~100k numbers.
 
-## Phase 5: Ranked top-k
+## Phase 5: Ranked top-k ✅
 
-- An ordering operator `col <=> 'q'` (distance = match tier) plus `amgettuple` with `amcanorderbyop`, so `ORDER BY … LIMIT 20` becomes an ordered index scan.
-- Tiers are produced lazily (exact first, then prefix, …), so the scan stops as soon as the executor has 20 visible rows.
-- Prefixes stream from the FST in term order, without expanding all matches: this is what fixes the short-prefix p99.
+- ✅ `~>` (search-box match) and `<~>` (rank: 0 exact … 4 two typos). `ORDER BY col <~> q LIMIT k` is an ordered index scan (`amgettuple`, `amcanorderbyop`) that produces tiers lazily and stops at k.
+- ✅ Prefixes and typos stream from the dictionary 32 terms at a time.
+- ✅ Typo automaton as a lazy DFA; one merged segment after `CREATE INDEX`.
+- ✅ `tin.search_typos` (0–2), like Typesense's `num_typos`.
+
+At 5M rows: every query kind has p99 < 7 ms (budget 2) or < 2 ms (budget 1), with the best recall of the three engines. Exact lookups (0.9 ms at budget 1) stay slower than a B-tree's 0.1 ms, because a top-10 must find the nine next-best rows too.
 
 ## Phase 6: Update storm
 

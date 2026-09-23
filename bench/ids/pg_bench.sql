@@ -36,11 +36,12 @@ BEGIN
   END LOOP;
 END $$;
 
--- tin, same tiers on one index (built WITH (grams = true)):
+-- tin, Phase 4: the same fallback tiers as plain, on one index built
+-- WITH (grams = true):
 --   1. exact, then prefix (`q* -q`);
---   2. only if none: fragments (`*q*`, trigram candidates + recheck);
+--   2. only if none: fragments (`*q*`, gram candidates + recheck);
 --   3. only if still none: one typo (`q~`), then two (`q~2`, 7+ chars).
-CREATE OR REPLACE FUNCTION search_tin(q text, k int DEFAULT 10)
+CREATE OR REPLACE FUNCTION search_tintiers(q text, k int DEFAULT 10)
 RETURNS TABLE (id bigint, tier int) LANGUAGE plpgsql AS $$
 DECLARE
   t text := lower(btrim(q));
@@ -64,6 +65,22 @@ BEGIN
   IF n > 0 OR length(t) < 7 THEN RETURN; END IF;
   RETURN QUERY SELECT s.id, 4 FROM shipments s WHERE s.search_text ==> (t || '~2') LIMIT k;
 END $$;
+
+-- tin, Phase 5: one ranked query. The index returns rows tier by tier
+-- (0 exact, 1 prefix, 2 fragment, 3-4 typos) and stops at k.
+CREATE OR REPLACE FUNCTION search_tin(q text, k int DEFAULT 10)
+RETURNS TABLE (id bigint, tier int) LANGUAGE sql AS $$
+  SELECT s.id, (s.search_text <~> q)::int FROM shipments s
+  WHERE s.search_text ~> q ORDER BY s.search_text <~> q LIMIT k
+$$;
+
+-- The same with at most one typo per term (tin.search_typos = 1, like
+-- Typesense's num_typos = 1).
+CREATE OR REPLACE FUNCTION search_tin1(q text, k int DEFAULT 10)
+RETURNS TABLE (id bigint, tier int) LANGUAGE sql SET tin.search_typos = 1 AS $$
+  SELECT s.id, (s.search_text <~> q)::int FROM shipments s
+  WHERE s.search_text ~> q ORDER BY s.search_text <~> q LIMIT k
+$$;
 
 -- psql -v engines=tin -v out=tin_results.tsv to run a subset.
 \if :{?engines}

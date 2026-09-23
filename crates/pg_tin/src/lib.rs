@@ -37,6 +37,17 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::UNIT_KB,
     );
+    GucRegistry::define_int_guc(
+        c"tin.search_typos",
+        c"Typos per term that search-box queries (~>, <~>) tolerate: 0, 1 or 2.",
+        c"Like Typesense's num_typos. Fewer typo tiers make ORDER BY col <~> q LIMIT k faster when \
+          few rows match exactly, since the scan no longer fills k from 2-typo matches.",
+        &scan::SEARCH_TYPOS,
+        0,
+        2,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 /// `doc ==> query`: the non-index path (sequential scans, rechecks). Uses the
@@ -56,6 +67,40 @@ fn tin_match(doc: &str, query: &str) -> bool {
         }
         last.as_ref().unwrap().1.matches_text(doc, &mut Analyzer::new())
     })
+}
+
+thread_local! {
+    static LAST_SEARCH: std::cell::RefCell<Option<(String, i32, tin_core::SearchBox)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The tier of `doc` for search box `query`, if it matches (the non-index
+/// path for `~>` and `<~>`).
+fn search_tier(doc: &str, query: &str) -> Option<u8> {
+    LAST_SEARCH.with(|last| {
+        let mut last = last.borrow_mut();
+        let typos = scan::SEARCH_TYPOS.get();
+        if last.as_ref().is_none_or(|(q, t, _)| q != query || *t != typos) {
+            *last = Some((query.to_owned(), typos, scan::parse_search(query)));
+        }
+        last.as_ref().unwrap().2.tier_of_text(doc, &mut Analyzer::new())
+    })
+}
+
+/// `doc ~> query`: `doc` matches the search box `query` at some tier
+/// (exact, prefix, fragment, or typo). `STABLE`, not `IMMUTABLE`: the typo
+/// tiers depend on `tin.search_typos`.
+#[pg_extern(stable, parallel_safe, strict, cost = 10)]
+fn tin_search_match(doc: &str, query: &str) -> bool {
+    search_tier(doc, query).is_some()
+}
+
+/// `doc <~> query`: how well `doc` matches the search box `query`: 0 exact,
+/// 1 prefix, 2 fragment, 3 one typo, 4 two typos, infinity for no match.
+/// `ORDER BY col <~> q` uses the index's ranked scan.
+#[pg_extern(stable, parallel_safe, strict, cost = 10)]
+fn tin_search_distance(doc: &str, query: &str) -> f64 {
+    search_tier(doc, query).map_or(f64::INFINITY, |t| t as f64)
 }
 
 /// Open `index` (an OID; pass `'name'::regclass`) and check it is a tin index.
@@ -138,7 +183,8 @@ COMMENT ON ACCESS METHOD tin IS 'tin: ctid two-level-bitmap full-text index';
 fn tin_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let mut am = unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
     // Everything not set here stays zero/false/None (alloc_node zeroes).
-    am.amstrategies = 1;
+    am.amstrategies = 3;
+    am.amcanorderbyop = true; // ORDER BY col <~> q
     am.amsupport = 0;
     am.amoptionalkey = false; // a scan always needs a ==> condition
     am.amusemaintenanceworkmem = true;
@@ -155,8 +201,8 @@ fn tin_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutin
     am.ambeginscan = Some(scan::ambeginscan);
     am.amrescan = Some(scan::amrescan);
     am.amgetbitmap = Some(scan::amgetbitmap);
+    am.amgettuple = Some(scan::amgettuple);
     am.amendscan = Some(scan::amendscan);
-    // No amgettuple: tin only serves bitmap scans (like GIN).
     am.into_pg_boxed()
 }
 
@@ -171,11 +217,29 @@ CREATE OPERATOR ==> (
 );
 COMMENT ON OPERATOR ==> (text, text) IS 'full-text match: document ==> tin query';
 
+CREATE OPERATOR ~> (
+    LEFTARG = text,
+    RIGHTARG = text,
+    FUNCTION = tin_search_match,
+    RESTRICT = tin_restrict,
+    JOIN = contjoinsel
+);
+COMMENT ON OPERATOR ~> (text, text) IS 'search-box match: exact, prefix, fragment or typo';
+
+CREATE OPERATOR <~> (
+    LEFTARG = text,
+    RIGHTARG = text,
+    FUNCTION = tin_search_distance
+);
+COMMENT ON OPERATOR <~> (text, text) IS 'search-box rank: 0 exact, 1 prefix, 2 fragment, 3-4 typos';
+
 CREATE OPERATOR CLASS text_tin_ops DEFAULT FOR TYPE text USING tin AS
-    OPERATOR 1 ==> (text, text);
+    OPERATOR 1 ==> (text, text),
+    OPERATOR 2 ~> (text, text),
+    OPERATOR 3 <~> (text, text) FOR ORDER BY float_ops;
 "#,
     name = "tin_operator",
-    requires = [tin_match, tin_handler, tin_restrict]
+    requires = [tin_match, tin_search_match, tin_search_distance, tin_handler, tin_restrict]
 );
 
 #[pg_guard]

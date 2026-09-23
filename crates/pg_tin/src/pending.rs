@@ -10,15 +10,11 @@
 
 use tin_core::{Plan, SortedTerms, Tid};
 
-pub struct Record {
-    pub tid: Tid,
-    pub terms: Vec<String>,
-}
+/// A decoded record: what ranked scans call a pending document.
+pub use tin_core::rank::PendingDoc as Record;
 
-impl Record {
-    pub fn matches(&self, plan: &Plan) -> bool {
-        plan.matches(&SortedTerms(&self.terms))
-    }
+pub fn matches(rec: &Record, plan: &Plan) -> bool {
+    plan.matches(&SortedTerms(&rec.terms))
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {

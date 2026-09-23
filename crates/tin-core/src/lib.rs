@@ -25,6 +25,8 @@ pub mod index;
 pub mod pattern;
 pub mod postings;
 pub mod query;
+pub mod rank;
+pub mod search;
 pub mod segment;
 pub mod tid;
 pub mod tokenize;
@@ -32,6 +34,7 @@ mod varint;
 
 pub use index::Index;
 pub use query::{Plan, Query, QueryError, SortedTerms, TermSet};
-pub use segment::{Segment, SegmentBuilder};
+pub use search::SearchBox;
+pub use segment::{Segment, SegmentBuilder, TermFilter};
 pub use tid::Tid;
 pub use tokenize::Analyzer;

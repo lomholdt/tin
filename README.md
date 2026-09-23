@@ -11,7 +11,7 @@ The core idea: **postings are Postgres ctids stored as two-level bitmaps**, with
 
 ## Status
 
-**Phases 0–4 are done** (of 0–8): the Rust engine, and a **PostgreSQL 18 index access method** with writes, VACUUM, crash safety, and identifier search: prefix, fragment, and typo-tolerant matching.
+**Phases 0–5 are done** (of 0–8): the Rust engine, and a **PostgreSQL 18 index access method** with writes, VACUUM, crash safety, and identifier search: prefix, fragment, and typo-tolerant matching.
 
 ```sql
 CREATE EXTENSION pg_tin;
@@ -22,6 +22,9 @@ CREATE INDEX shipments_tin ON shipments USING tin (search_text) WITH (grams = tr
 SELECT * FROM shipments WHERE search_text ==> 'msku60*' LIMIT 10;       -- prefix
 SELECT * FROM shipments WHERE search_text ==> '*6018200*' LIMIT 10;     -- fragment
 SELECT * FROM shipments WHERE search_text ==> 'msku6012800~' LIMIT 10;  -- one typo
+
+-- search box: exact > prefix > fragment > typo, top 10 via an ordered index scan
+SELECT * FROM shipments WHERE search_text ~> 'MSKU60128' ORDER BY search_text <~> 'MSKU60128' LIMIT 10;
 ```
 
 | | |
@@ -31,13 +34,13 @@ SELECT * FROM shipments WHERE search_text ==> 'msku6012800~' LIMIT 10;  -- one t
 | Index size | **19.4% of the text** (TIN post: "roughly 20%" for a minimal index) |
 | Speed (4 threads, COUNT) | 11k–22k queries/s, 1.5–2.4× an uncompressed in-RAM baseline; p99 ≈ 1.4 ms or better |
 | In PostgreSQL 18 vs GIN | build 35.5 s vs 55.8 s; size 157 MB vs 388 MB; median 2.2–2.5× faster on selective queries; index = seqscan on 40/40 sampled queries |
-| 5M shipping IDs vs plain Postgres / Typesense | fragments 0.5–0.6 ms p50 (plain 12–16 ms, same rows; Typesense misses them); typos 2.1 ms p50 at 94.7% hit@10 (Typesense 83.4%, plain 1.2 s); exact 0.14 ms ([details](docs/BENCHMARKS-IDS.md)) |
+| 5M shipping IDs vs plain Postgres / Typesense | ranked search box, p99 ≤ 2 ms for every query kind at `tin.search_typos = 1`; best recall of the three (fragments 98–100% hit@10, typos 100%) ([details](docs/BENCHMARKS-IDS.md)) |
 
 The details, including where we deviate from the posts and why, are in:
 
 - [docs/DESIGN.md](docs/DESIGN.md)
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/BENCHMARKS-IDS.md](docs/BENCHMARKS-IDS.md) (identifier search)
-- [docs/ROADMAP.md](docs/ROADMAP.md): aimed at Typesense-style search over ~5M shipping identifiers. Next up: Phase 5, ranked top-k through an ordered index scan.
+- [docs/ROADMAP.md](docs/ROADMAP.md): aimed at Typesense-style search over ~5M shipping identifiers. Next up: Phase 6, the full benchmark incl. an update storm, then zero-copy reads and a parallel build.
 
 ## Layout
 
