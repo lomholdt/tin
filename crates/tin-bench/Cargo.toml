@@ -1,0 +1,12 @@
+[package]
+name = "tin-bench"
+description = "Benchmark harness: simulated heap layout, index build, query set, baseline comparison."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+tin-core.workspace = true
+rayon = "1"
+rustc-hash = "2"

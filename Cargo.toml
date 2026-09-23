@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/tin-core", "crates/tin-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[workspace.dependencies]
+tin-core = { path = "crates/tin-core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1 # keep symbols for perf/flamegraphs
+
+[profile.bench]
+inherits = "release"

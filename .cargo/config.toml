@@ -1,0 +1,4 @@
+# Let rustc auto-vectorize the bitmap kernels (AVX2 / AVX-512 when present).
+# Phase 1 (Postgres extension) will switch to runtime dispatch so one binary runs anywhere.
+[build]
+rustflags = ["-C", "target-cpu=native"]

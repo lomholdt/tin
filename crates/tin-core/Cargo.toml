@@ -1,0 +1,13 @@
+[package]
+name = "tin-core"
+description = "Storage format + query engine for a ctid-keyed, two-level-bitmap inverted index."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fst = "0.4"
+rayon = "1"
+rustc-hash = "2"
+unicode-normalization = "0.1"
+unicode-segmentation = "1"
