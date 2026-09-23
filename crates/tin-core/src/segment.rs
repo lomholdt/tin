@@ -13,17 +13,19 @@
 
 use std::collections::BTreeMap;
 
-use fst::{Map, MapBuilder, Streamer};
+use fst::automaton::Str;
+use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 use rustc_hash::FxHashMap;
 
-use crate::cursor::{self, And, AndNot, Cursor, Empty, Or, SpaceTable};
+use crate::cursor::{self, And, AndNot, Bits, Cursor, Empty, Or, SpaceTable};
+use crate::pattern::{self, Osa, GRAM_LEN, GRAM_MARK};
 use crate::postings::{Encoder, Encoding, PageDir, TermPostings, TAIL_PADDING};
 use crate::query::Plan;
 use crate::tid::Tid;
 use crate::tokenize::Analyzer;
 
 const MAGIC: &[u8; 4] = b"TIN\0";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
@@ -33,6 +35,8 @@ pub struct SegmentMeta {
     pub doc_count: u64,
     pub term_count: u64,
     pub posting_count: u64,
+    /// Terms' character trigrams are indexed too (for fragment search).
+    pub grams: bool,
 }
 
 pub struct Segment {
@@ -63,6 +67,7 @@ pub struct SegmentBuilder {
     last_tid: Option<Tid>,
     doc_count: u64,
     open_ended: bool,
+    grams: bool,
     approx_bytes: usize,
 }
 
@@ -81,6 +86,7 @@ impl SegmentBuilder {
             last_tid: None,
             doc_count: 0,
             open_ended: false,
+            grams: false,
             approx_bytes: 0,
         }
     }
@@ -97,6 +103,13 @@ impl SegmentBuilder {
         self.doc_count
     }
 
+    /// Also index each term's character trigrams, enabling fast
+    /// `*fragment*` search (at the cost of a bigger index).
+    pub fn with_grams(mut self, on: bool) -> Self {
+        self.grams = on;
+        self
+    }
+
     /// Rough heap footprint, for memory-bounded builds. O(1): maintained as
     /// postings and terms are added (postings counted at 12 bytes for
     /// `Vec` growth slack).
@@ -108,9 +121,10 @@ impl SegmentBuilder {
     /// segment's block range.
     pub fn add(&mut self, tid: Tid, text: &str) {
         self.begin_doc(tid);
+        let grams = self.grams;
         let Self { analyzer, term_ids, terms, postings, approx_bytes, .. } = self;
         analyzer.for_each_term(text, |term, _pos| {
-            Self::push_term(term_ids, terms, postings, approx_bytes, tid, term);
+            Self::push_term(term_ids, terms, postings, approx_bytes, tid, term, grams);
         });
     }
 
@@ -118,9 +132,10 @@ impl SegmentBuilder {
     /// record). Same ordering rules as [`add`](Self::add).
     pub fn add_terms<'t>(&mut self, tid: Tid, doc_terms: impl IntoIterator<Item = &'t str>) {
         self.begin_doc(tid);
+        let grams = self.grams;
         let Self { term_ids, terms, postings, approx_bytes, .. } = self;
         for term in doc_terms {
-            Self::push_term(term_ids, terms, postings, approx_bytes, tid, term);
+            Self::push_term(term_ids, terms, postings, approx_bytes, tid, term, grams);
         }
     }
 
@@ -150,7 +165,13 @@ impl SegmentBuilder {
         approx_bytes: &mut usize,
         tid: Tid,
         term: &str,
+        grams: bool,
     ) {
+        if grams {
+            crate::pattern::grams(term, |g| {
+                Self::push_term(term_ids, terms, postings, approx_bytes, tid, g, false)
+            });
+        }
         let id = match term_ids.get(term) {
             Some(&id) => id,
             None => {
@@ -188,7 +209,7 @@ impl SegmentBuilder {
         let mut order: Vec<u32> = (0..self.terms.len() as u32).collect();
         order.sort_unstable_by(|&a, &b| self.terms[a as usize].cmp(&self.terms[b as usize]));
 
-        let mut asm = Assembler::new(self.first_block, self.widths);
+        let mut asm = Assembler::new(self.first_block, self.widths, self.grams);
         let mut stats: BTreeMap<(C, Encoding), ClassStats> = BTreeMap::new();
         for id in order {
             let tids = &self.postings[id as usize];
@@ -204,6 +225,7 @@ impl SegmentBuilder {
 /// directory. Shared by fresh builds and merges.
 struct Assembler {
     first_block: u32,
+    grams: bool,
     widths: Vec<u16>,
     dict: MapBuilder<Vec<u8>>,
     postings: Vec<u8>,
@@ -213,9 +235,10 @@ struct Assembler {
 }
 
 impl Assembler {
-    fn new(first_block: u32, widths: Vec<u16>) -> Self {
+    fn new(first_block: u32, widths: Vec<u16>, grams: bool) -> Self {
         Assembler {
             first_block,
+            grams,
             widths,
             dict: MapBuilder::memory(),
             postings: Vec::new(),
@@ -258,6 +281,7 @@ impl Assembler {
                 doc_count: docs.len() as u64,
                 term_count: self.term_count,
                 posting_count: self.posting_count,
+                grams: self.grams,
             },
             widths: self.widths,
             dict,
@@ -286,7 +310,8 @@ impl Segment {
             *w = (*w).max(t.offset);
         }
 
-        let mut asm = Assembler::new(first_block, widths);
+        let grams = inputs.iter().any(|(s, _)| s.meta.grams);
+        let mut asm = Assembler::new(first_block, widths, grams);
         let mut op = fst::map::OpBuilder::new();
         for (seg, _) in inputs {
             op = op.add(&seg.dict);
@@ -371,24 +396,49 @@ impl Segment {
 
     /// Build the cursor tree for `plan` against this segment.
     pub fn cursor<'a>(&'a self, plan: &Plan) -> Box<dyn Cursor + 'a> {
+        self.cursor_in(plan, false)
+    }
+
+    /// `negated`: under a NOT, where every leaf must be exact (subtracting a
+    /// candidate superset would lose real matches).
+    fn cursor_in<'a>(&'a self, plan: &Plan, negated: bool) -> Box<dyn Cursor + 'a> {
         match plan {
             Plan::Term(t) => match self.term(t) {
                 Some(tp) => tp.cursor(),
                 None => Box::new(Empty),
             },
+            Plan::Prefix(p) => self.expand(self.dict.search(Str::new(p).starts_with()).into_stream()),
+            Plan::Fuzzy(q, k) => self.expand(self.dict.search(Osa::new(q.as_bytes(), *k)).into_stream()),
+            Plan::Fragment(f) => {
+                if self.meta.grams && !negated && f.chars().count() >= GRAM_LEN {
+                    // Candidates: tuples with all of the fragment's trigrams
+                    // (possibly spread over different terms); callers recheck.
+                    let mut grams_of = Vec::new();
+                    pattern::grams(f, |g| grams_of.push(Plan::Term(g.to_owned())));
+                    self.cursor_in(&Plan::And(grams_of), false)
+                } else {
+                    // Exact: scan the dictionary.
+                    let f = f.as_str();
+                    self.expand_filtered(self.dict.stream(), |t| t.contains(f))
+                }
+            }
             Plan::And(cs) => {
                 let mut kids = Vec::with_capacity(cs.len());
                 for c in cs {
-                    let k = self.cursor(c);
+                    let k = self.cursor_in(c, negated);
                     if k.cost() == 0 {
                         return Box::new(Empty);
                     }
                     kids.push(k);
                 }
+                if kids.len() == 1 {
+                    return kids.pop().unwrap();
+                }
                 Box::new(And::new(kids))
             }
             Plan::Or(cs) => {
-                let kids: Vec<_> = cs.iter().map(|c| self.cursor(c)).filter(|k| k.cost() > 0).collect();
+                let kids: Vec<_> =
+                    cs.iter().map(|c| self.cursor_in(c, negated)).filter(|k| k.cost() > 0).collect();
                 match kids.len() {
                     0 => Box::new(Empty),
                     1 => kids.into_iter().next().unwrap(),
@@ -396,17 +446,60 @@ impl Segment {
                 }
             }
             Plan::AndNot(p, n) => {
-                let pos = self.cursor(p);
+                let pos = self.cursor_in(p, negated);
                 if pos.cost() == 0 {
                     return pos;
                 }
-                let neg = self.cursor(n);
+                let neg = self.cursor_in(n, true);
                 if neg.cost() == 0 {
                     return pos;
                 }
                 Box::new(AndNot::new(pos, neg))
             }
         }
+    }
+
+    /// Union of the postings of every (non-gram) term in `stream`, as one
+    /// tuple-space bitmap.
+    fn expand<'a, S>(&'a self, stream: S) -> Box<dyn Cursor + 'a>
+    where
+        S: for<'s> Streamer<'s, Item = (&'s [u8], u64)>,
+    {
+        self.expand_filtered(stream, |_| true)
+    }
+
+    fn expand_filtered<'a, S>(&'a self, mut stream: S, keep: impl Fn(&str) -> bool) -> Box<dyn Cursor + 'a>
+    where
+        S: for<'s> Streamer<'s, Item = (&'s [u8], u64)>,
+    {
+        let mut bits = vec![0u64; self.docs.len()];
+        let mut any = false;
+        while let Some((term, v)) = stream.next() {
+            let Ok(term) = std::str::from_utf8(term) else { continue };
+            if term.starts_with(GRAM_MARK) || !keep(term) {
+                continue;
+            }
+            any = true;
+            match TermPostings::from_value(v, &self.postings) {
+                TermPostings::Singleton(tid) => {
+                    if let Some(b) = self.tid_bit(tid) {
+                        bits[(b >> 6) as usize] |= 1 << (b & 63);
+                    }
+                }
+                tp => {
+                    let mut c = tp.cursor();
+                    cursor::for_each_tid(c.as_mut(), &self.spaces, None, |t| {
+                        if let Some(b) = self.tid_bit(t) {
+                            bits[(b >> 6) as usize] |= 1 << (b & 63);
+                        }
+                    });
+                }
+            }
+        }
+        if !any {
+            return Box::new(Empty);
+        }
+        Box::new(Bits::new(bits, &self.spaces))
     }
 
     pub fn search(&self, plan: &Plan, f: impl FnMut(Tid)) {
@@ -492,6 +585,7 @@ impl Segment {
         for v in [self.meta.doc_count, self.meta.term_count, self.meta.posting_count] {
             out.extend_from_slice(&v.to_le_bytes());
         }
+        out.extend_from_slice(&(self.meta.grams as u32).to_le_bytes());
         out.extend_from_slice(&(self.widths.len() as u64).to_le_bytes());
         for w in &self.widths {
             out.extend_from_slice(&w.to_le_bytes());
@@ -522,6 +616,7 @@ impl Segment {
             doc_count: r.u64()?,
             term_count: r.u64()?,
             posting_count: r.u64()?,
+            grams: r.u32()? & 1 == 1,
         };
         let n_widths = r.u64()? as usize;
         let widths: Vec<u16> = r

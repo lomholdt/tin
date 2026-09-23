@@ -22,6 +22,7 @@ struct BuildState {
     block: Option<u32>,
     page: Vec<(u16, String)>,
     builder: SegmentBuilder,
+    grams: bool,
     segments: Vec<SegmentRef>,
     budget: usize,
     tuples: u64,
@@ -40,7 +41,10 @@ impl BuildState {
     }
 
     unsafe fn finish_segment(&mut self, next_first_block: u32) {
-        let builder = std::mem::replace(&mut self.builder, SegmentBuilder::open_ended(next_first_block));
+        let builder = std::mem::replace(
+            &mut self.builder,
+            SegmentBuilder::open_ended(next_first_block).with_grams(self.grams),
+        );
         if builder.doc_count() == 0 {
             return;
         }
@@ -106,7 +110,8 @@ pub unsafe extern "C-unwind" fn ambuild(
         tmp: PgMemoryContexts::new("tin build tuple"),
         block: None,
         page: Vec::new(),
-        builder: SegmentBuilder::open_ended(0),
+        builder: SegmentBuilder::open_ended(0).with_grams(crate::options::grams(index)),
+        grams: crate::options::grams(index),
         segments: Vec::new(),
         budget: (pg_sys::maintenance_work_mem as usize) * 1024,
         tuples: 0,

@@ -64,7 +64,8 @@ pub unsafe fn flush_locked(index: pg_sys::Relation, lock: &MetaLock, meta: &mut 
     records.sort_by_key(|r| r.tid);
     records.dedup_by_key(|r| r.tid); // a tid is only reused after VACUUM removed its record
 
-    let mut builder = SegmentBuilder::open_ended(records[0].tid.block);
+    let mut builder =
+        SegmentBuilder::open_ended(records[0].tid.block).with_grams(crate::options::grams(index));
     for r in &records {
         builder.add_terms(r.tid, r.terms.iter().map(String::as_str));
     }

@@ -91,6 +91,9 @@ fn crate_max_offset() -> u16 {
 fn eval(plan: &Plan, truth: &BTreeMap<String, BTreeSet<Tid>>) -> BTreeSet<Tid> {
     match plan {
         Plan::Term(t) => truth.get(t).cloned().unwrap_or_default(),
+        Plan::Prefix(p) => union_where(truth, |t| t.starts_with(p.as_str())),
+        Plan::Fragment(f) => union_where(truth, |t| t.contains(f.as_str())),
+        Plan::Fuzzy(q, k) => union_where(truth, |t| osa(t.as_bytes(), q.as_bytes()) <= *k as usize),
         Plan::And(cs) => {
             let mut it = cs.iter().map(|c| eval(c, truth));
             let first = it.next().unwrap();
@@ -99,6 +102,10 @@ fn eval(plan: &Plan, truth: &BTreeMap<String, BTreeSet<Tid>>) -> BTreeSet<Tid> {
         Plan::Or(cs) => cs.iter().map(|c| eval(c, truth)).fold(BTreeSet::new(), |acc, s| &acc | &s),
         Plan::AndNot(p, n) => &eval(p, truth) - &eval(n, truth),
     }
+}
+
+fn union_where(truth: &BTreeMap<String, BTreeSet<Tid>>, pred: impl Fn(&str) -> bool) -> BTreeSet<Tid> {
+    truth.iter().filter(|(t, _)| pred(t)).flat_map(|(_, s)| s.iter().copied()).collect()
 }
 
 fn random_plan(rng: &mut Rng, depth: u32) -> Plan {
@@ -388,4 +395,177 @@ fn merge_keeps_only_live_tuples() {
     let inputs: Vec<(&Segment, Option<&[u64]>)> =
         segs.iter().zip(&empty).map(|(s, l)| (s, Some(l.as_slice()))).collect();
     assert!(Segment::merge(&inputs).is_none());
+}
+
+/// Identifier-style corpus: each tuple holds 1-3 container/booking-like IDs.
+fn id_corpus(seed: u64, n: u32) -> Vec<(Tid, Vec<String>)> {
+    let mut rng = Rng(seed);
+    let owners = ["msku", "mrku", "maeu", "cmau", "hlxu", "tghu"];
+    (0..n)
+        .map(|i| {
+            let tid = Tid::new(i / 40, (i % 40) as u16 + 1);
+            let k = 1 + rng.below(3) as usize;
+            let ids = (0..k)
+                .map(|_| {
+                    if rng.chance(0.5) {
+                        format!("{}{:07}", owners[rng.below(6) as usize], rng.below(10_000_000))
+                    } else {
+                        format!("{:09}", rng.below(1_000_000_000))
+                    }
+                })
+                .collect();
+            (tid, ids)
+        })
+        .collect()
+}
+
+/// Reference OSA distance.
+#[allow(clippy::needless_range_loop)]
+fn osa(a: &[u8], b: &[u8]) -> usize {
+    let (n, m) = (a.len(), b.len());
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=m {
+        d[0][j] = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = (a[i - 1] != b[j - 1]) as usize;
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[n][m]
+}
+
+type Pred = Box<dyn Fn(&str) -> bool>;
+
+#[test]
+fn prefix_fragment_and_typo_patterns_match_brute_force() {
+    let docs = id_corpus(91, 6000);
+    let mut rng = Rng(92);
+    for grams in [false, true] {
+        let mut b = SegmentBuilder::new(0, u32::MAX).with_grams(grams);
+        for (tid, ids) in &docs {
+            b.add(*tid, &ids.join(" "));
+        }
+        let seg = Segment::from_bytes(&b.finish().to_bytes()).unwrap();
+        assert_eq!(seg.meta().grams, grams);
+        let idx = Index::from_segments(vec![seg]);
+        let mut a = Analyzer::new();
+        for q in 0..300 {
+            let (_, ids) = &docs[rng.below(docs.len() as u64) as usize];
+            let id = &ids[rng.below(ids.len() as u64) as usize];
+            let (query, pred): (String, Pred) = match q % 5 {
+                0 => {
+                    let p = id[..3 + rng.below(6) as usize].to_owned();
+                    (format!("{p}*"), Box::new(move |t: &str| t.starts_with(&p)))
+                }
+                1 => {
+                    let s = rng.below(4) as usize;
+                    let f = id[s..s + 3 + rng.below(4) as usize].to_owned();
+                    (format!("*{f}*"), Box::new(move |t: &str| t.contains(&f)))
+                }
+                2 => {
+                    let mut t = id.clone().into_bytes();
+                    let i = rng.below(t.len() as u64 - 1) as usize;
+                    t.swap(i, i + 1);
+                    let t = String::from_utf8(t).unwrap();
+                    (format!("{t}~"), Box::new(move |x: &str| osa(x.as_bytes(), t.as_bytes()) <= 1))
+                }
+                3 => {
+                    let mut t = id.clone().into_bytes();
+                    t[5] = b'0' + ((t[5] - b'0' + 1) % 10);
+                    t.remove(2);
+                    let t = String::from_utf8(t).unwrap();
+                    (format!("{t}~2"), Box::new(move |x: &str| osa(x.as_bytes(), t.as_bytes()) <= 2))
+                }
+                _ => {
+                    let p = id[..4].to_owned();
+                    let f = id[id.len() - 3..].to_owned();
+                    (format!("{p}* -*{f}*"), Box::new(move |t: &str| t.starts_with(&p) && !t.contains(&f)))
+                }
+            };
+            let plan = Plan::parse(&query, &mut a).unwrap();
+            // Brute force. (The NOT case is a per-document predicate.)
+            let want: Vec<Tid> = docs
+                .iter()
+                .filter(|(_, ids)| {
+                    if q % 5 == 4 {
+                        let p = &id[..4];
+                        let f = &id[id.len() - 3..];
+                        ids.iter().any(|t| t.starts_with(p)) && !ids.iter().any(|t| t.contains(f))
+                    } else {
+                        ids.iter().any(|t| pred(t))
+                    }
+                })
+                .map(|(t, _)| *t)
+                .collect();
+            let got = idx.search_vec(&plan);
+            if plan.needs_recheck() && grams {
+                // Candidates: a superset that the recheck narrows to the truth.
+                let got_set: BTreeSet<Tid> = got.iter().copied().collect();
+                assert!(want.iter().all(|t| got_set.contains(t)), "{query}: missing candidates");
+                let text: std::collections::HashMap<Tid, String> =
+                    docs.iter().map(|(t, ids)| (*t, ids.join(" "))).collect();
+                let rechecked: Vec<Tid> =
+                    got.into_iter().filter(|t| plan.matches_text(&text[t], &mut a)).collect();
+                assert_eq!(rechecked, want, "{query} (grams, after recheck)");
+            } else {
+                assert_eq!(got, want, "{query} (grams={grams})");
+            }
+            // The single-document evaluator agrees too.
+            let scanned: Vec<Tid> = docs
+                .iter()
+                .filter(|(_, ids)| plan.matches_text(&ids.join(" "), &mut a))
+                .map(|(t, _)| *t)
+                .collect();
+            assert_eq!(scanned, want, "{query} matches_text");
+        }
+    }
+}
+
+#[test]
+fn patterns_combined_with_other_conditions() {
+    // Patterns under AND / OR / NOT with other terms: exercises page masks
+    // on expanded pattern cursors.
+    let docs = id_corpus(93, 8000);
+    let mut rng = Rng(94);
+    let mut b = SegmentBuilder::new(0, u32::MAX).with_grams(true);
+    for (tid, ids) in &docs {
+        b.add(*tid, &ids.join(" "));
+    }
+    let idx = Index::from_segments(vec![b.finish()]);
+    let mut a = Analyzer::new();
+    let text: std::collections::HashMap<Tid, String> =
+        docs.iter().map(|(t, ids)| (*t, ids.join(" "))).collect();
+    let mut nonempty = 0;
+    for q in 0..400 {
+        let (_, ids) = &docs[rng.below(docs.len() as u64) as usize];
+        let x = &ids[rng.below(ids.len() as u64) as usize];
+        let y = &ids[rng.below(ids.len() as u64) as usize];
+        let other = &docs[rng.below(docs.len() as u64) as usize].1[0];
+        let query = match q % 5 {
+            0 => format!("{}* {}", &x[..4], y),
+            1 => format!("{}~ {}", x, y),
+            2 => format!("({}* OR {}~) {}*", &x[..5], other, &y[..3]),
+            3 => format!("{}* -{}", &x[..4], y),
+            _ => format!("*{}* {}*", &x[x.len() - 4..], &y[..4]),
+        };
+        let plan = Plan::parse(&query, &mut a).unwrap();
+        let want: Vec<Tid> =
+            docs.iter().filter(|(t, _)| plan.matches_text(&text[t], &mut a)).map(|(t, _)| *t).collect();
+        nonempty += !want.is_empty() as usize;
+        let got: Vec<Tid> =
+            idx.search_vec(&plan).into_iter().filter(|t| plan.matches_text(&text[t], &mut a)).collect();
+        assert_eq!(got, want, "{query}");
+        if !plan.needs_recheck() {
+            assert_eq!(idx.search_vec(&plan), want, "{query} (exact)");
+        }
+    }
+    assert!(nonempty > 300, "queries should mostly have matches ({nonempty})");
 }

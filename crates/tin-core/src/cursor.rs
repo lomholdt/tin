@@ -143,6 +143,20 @@ impl SpaceTable {
     pub fn bytes(&self) -> usize {
         self.starts.len() * 4 + self.bases.len() * 8
     }
+
+    /// The group whose tuple-space range holds segment-wide bit `bit`.
+    pub fn group_of_bit(&self, bit: u64) -> Option<u32> {
+        let i = self.bases.partition_point(|&b| b <= bit);
+        (i > 0).then(|| self.first_group + (i - 1) as u32)
+    }
+
+    /// Segment-wide bit where group `g` starts (0 before the first group).
+    pub fn base_of(&self, g: u32) -> u64 {
+        match g.checked_sub(self.first_group) {
+            None => 0,
+            Some(i) => self.bases.get(i as usize).copied().unwrap_or(u64::MAX),
+        }
+    }
 }
 
 pub trait Cursor {
@@ -160,6 +174,87 @@ pub trait Cursor {
 
     /// Upper bound on the number of matches; AND evaluates cheapest first.
     fn cost(&self) -> u64;
+}
+
+/// Matches the set bits of a segment-wide tuple-space bitmap: the result of
+/// expanding a many-term pattern (prefix, typo, fragment scan) up front,
+/// which is far cheaper than a union of thousands of term cursors.
+pub struct Bits<'a> {
+    bits: Vec<u64>,
+    spaces: &'a SpaceTable,
+    count: u64,
+    cur: Option<u32>,
+    /// The current group's slice of `bits`, in group tuple-space layout.
+    group: Vec<u64>,
+    pages: PageBits,
+}
+
+impl<'a> Bits<'a> {
+    pub fn new(bits: Vec<u64>, spaces: &'a SpaceTable) -> Self {
+        let count = bits.iter().map(|w| w.count_ones() as u64).sum();
+        Bits { bits, spaces, count, cur: None, group: Vec::new(), pages: PageBits::ZERO }
+    }
+
+    fn next_set_bit(&self, from: u64) -> Option<u64> {
+        let mut w = (from >> 6) as usize;
+        if w >= self.bits.len() {
+            return None;
+        }
+        let mut word = self.bits[w] & (!0u64 << (from & 63));
+        loop {
+            if word != 0 {
+                return Some((w as u64) * 64 + word.trailing_zeros() as u64);
+            }
+            w += 1;
+            word = *self.bits.get(w)?;
+        }
+    }
+}
+
+impl Cursor for Bits<'_> {
+    fn seek(&mut self, target: u32) -> Option<u32> {
+        if let Some(g) = self.cur {
+            if g >= target {
+                return Some(g);
+            }
+        }
+        let bit = self.next_set_bit(self.spaces.base_of(target))?;
+        let g = self.spaces.group_of_bit(bit)?;
+        let space = self.spaces.group(g);
+        let base = space.base() as usize;
+        self.group.clear();
+        self.group.extend((0..space.words()).map(|i| bits_at(&self.bits, base + i * 64)));
+        let tail = space.bits() % 64;
+        if tail != 0 {
+            *self.group.last_mut().unwrap() &= (1u64 << tail) - 1;
+        }
+        self.pages = PageBits::ZERO;
+        let pages = &mut self.pages;
+        space.for_each_tuple(&self.group, &!PageBits::ZERO, |p, _| pages.set(p as usize));
+        self.cur = Some(g);
+        Some(g)
+    }
+
+    fn pages(&mut self) -> PageBits {
+        self.pages
+    }
+
+    fn or_into(&mut self, mask: &PageBits, space: &GroupSpace<'_>, out: &mut [u64]) {
+        for (lo, hi) in (*mask & self.pages).runs() {
+            let (from, to) = (space.start(lo), space.start(hi));
+            let mut b = from;
+            while b < to {
+                let n = (to - b).min(64 - (b & 63));
+                let m = if n == 64 { !0u64 } else { ((1u64 << n) - 1) << (b & 63) };
+                out[b >> 6] |= self.group[b >> 6] & m;
+                b += n;
+            }
+        }
+    }
+
+    fn cost(&self) -> u64 {
+        self.count
+    }
 }
 
 /// Matches nothing (a term missing from the segment).

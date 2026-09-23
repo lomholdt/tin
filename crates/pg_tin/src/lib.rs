@@ -14,6 +14,7 @@ use pgrx::{GucContext, GucFlags, GucRegistry, PgRelation};
 use tin_core::Analyzer;
 
 mod build;
+mod options;
 mod pending;
 mod scan;
 mod storage;
@@ -23,6 +24,7 @@ mod write;
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    options::register();
     GucRegistry::define_int_guc(
         c"tin.pending_list_limit",
         c"Size of a tin index's pending list before it is flushed into a new segment.",
@@ -145,7 +147,7 @@ fn tin_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutin
     am.ambulkdelete = Some(write::ambulkdelete);
     am.amvacuumcleanup = Some(write::amvacuumcleanup);
     am.amcostestimate = Some(amcostestimate);
-    am.amoptions = Some(amoptions);
+    am.amoptions = Some(options::amoptions);
     am.amvalidate = Some(amvalidate);
     am.ambeginscan = Some(scan::ambeginscan);
     am.amrescan = Some(scan::amrescan);
@@ -192,11 +194,6 @@ unsafe extern "C-unwind" fn amcostestimate(
     *selectivity = costs.indexSelectivity;
     *correlation = costs.indexCorrelation;
     *pages = costs.numIndexPages;
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn amoptions(_reloptions: pg_sys::Datum, _validate: bool) -> *mut pg_sys::bytea {
-    std::ptr::null_mut()
 }
 
 #[pg_guard]

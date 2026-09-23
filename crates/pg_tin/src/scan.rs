@@ -11,7 +11,8 @@
 //!   Segments themselves never change, so cached ones are reused by id.
 //! * only `pending_bytes` grew (inserts): read just the new records.
 //!
-//! Tids are handed to the executor as exact (`recheck = false`). That is
+//! Tids are handed to the executor as exact (`recheck = false`), except for
+//! plans with `*fragment*` patterns answered through trigrams. That is
 //! sound because VACUUM clears a dead tuple's liveness bit (or drops its
 //! pending record) in `ambulkdelete`, before the heap can reuse its line
 //! pointer. A scan whose cached liveness predates such a VACUUM still only
@@ -161,6 +162,9 @@ pub unsafe extern "C-unwind" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *m
         _ => Plan::And(plans),
     };
 
+    // Fragments resolved through grams yield candidates: let the executor
+    // recheck them with `tin_match`.
+    let recheck = plan.needs_recheck();
     let st = state((*scan).indexRelation);
     let st = st.borrow();
     const BATCH: usize = 4096;
@@ -168,7 +172,7 @@ pub unsafe extern "C-unwind" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *m
     let mut n = 0i64;
     let flush = |batch: &mut Vec<pg_sys::ItemPointerData>| {
         if !batch.is_empty() {
-            pg_sys::tbm_add_tuples(tbm, batch.as_mut_ptr(), batch.len() as i32, false);
+            pg_sys::tbm_add_tuples(tbm, batch.as_mut_ptr(), batch.len() as i32, recheck);
             batch.clear();
         }
     };

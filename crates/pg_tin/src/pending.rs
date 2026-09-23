@@ -8,7 +8,7 @@
 //! Terms are the document's distinct analyzed terms, sorted, so queries can
 //! evaluate a record with a binary search per term.
 
-use tin_core::{Plan, Tid};
+use tin_core::{Plan, SortedTerms, Tid};
 
 pub struct Record {
     pub tid: Tid,
@@ -17,7 +17,7 @@ pub struct Record {
 
 impl Record {
     pub fn matches(&self, plan: &Plan) -> bool {
-        plan.matches(&|t| self.terms.binary_search_by(|x| x.as_str().cmp(t)).is_ok())
+        plan.matches(&SortedTerms(&self.terms))
     }
 }
 

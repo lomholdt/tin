@@ -50,9 +50,21 @@ impl Baseline {
         self.postings.values().map(|l| l.len() * 8).sum()
     }
 
+    /// Union of the postings of every term satisfying `pred` (a full scan).
+    fn union_where(&self, pred: impl Fn(&str) -> bool) -> Cow<'_, [u64]> {
+        let mut v: Vec<u64> =
+            self.postings.iter().filter(|(t, _)| pred(t)).flat_map(|(_, l)| l.iter().copied()).collect();
+        v.sort_unstable();
+        v.dedup();
+        Cow::Owned(v)
+    }
+
     pub fn eval(&self, plan: &Plan) -> Cow<'_, [u64]> {
         match plan {
             Plan::Term(t) => Cow::Borrowed(self.postings.get(t.as_str()).map_or(&[][..], |v| v)),
+            Plan::Prefix(p) => self.union_where(|t| t.starts_with(p.as_str())),
+            Plan::Fragment(f) => self.union_where(|t| t.contains(f.as_str())),
+            Plan::Fuzzy(q, k) => self.union_where(|t| tin_core::pattern::osa_within(t, q, *k)),
             Plan::And(cs) => {
                 let mut sets: Vec<_> = cs.iter().map(|c| self.eval(c)).collect();
                 sets.sort_by_key(|s| s.len());

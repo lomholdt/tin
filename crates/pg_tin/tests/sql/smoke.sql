@@ -102,6 +102,37 @@ SELECT count(*) FROM docs WHERE body ==> 'bulk';
 SELECT same_as_seqscan('bulk');
 RESET tin.pending_list_limit;
 
+-- Identifier patterns on an index with grams: prefix, fragment, typo.
+CREATE TABLE ids (id serial PRIMARY KEY, txt text);
+INSERT INTO ids (txt)
+  SELECT 'MSKU' || lpad((i * 7919 % 10000000)::text, 7, '0') || ' ' || lpad((i * 104729 % 1000000000)::text, 9, '0')
+  FROM generate_series(1, 20000) i;
+CREATE INDEX ids_tin ON ids USING tin (txt) WITH (grams = true);
+CREATE FUNCTION ids_same_as_seqscan(q text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int[]; b int[];
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = on;
+  SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO a FROM ids WHERE txt ==> q;
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;
+  SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO b FROM ids WHERE txt ==> q;
+  RETURN a = b;
+END $$;
+SET enable_seqscan = off;
+SELECT txt FROM ids WHERE txt ==> 'msku0007919' ORDER BY id;
+SELECT count(*) FROM ids WHERE txt ==> 'msku00079*';
+SELECT txt FROM ids WHERE txt ==> 'msku0007991~' ORDER BY id;  -- swapped 1 and 9
+SELECT count(*) FROM ids WHERE txt ==> '*07919*';
+RESET enable_seqscan;
+SELECT q, ids_same_as_seqscan(q) FROM unnest(ARRAY[
+  'msku00*', '*79190*', '*4729*', 'msku0007919~', 'msku0007991~2', 'msku00* -*9*',
+  '(msku001* OR *4729*) msku*', '*0007*', 'msku1*']) q;
+-- New rows go to the pending list; patterns must see them too.
+INSERT INTO ids (txt) VALUES ('MSKU7777777 999999999'), ('MRKU7777770 888888888');
+SELECT q, ids_same_as_seqscan(q) FROM unnest(ARRAY['*777777*', 'msku7777777~', 'mrku*', '*99999*']) q;
+SELECT tin_flush('ids_tin'::regclass) AS flushed;
+SELECT q, ids_same_as_seqscan(q) FROM unnest(ARRAY['*777777*', 'msku7777777~', 'mrku*', '*99999*']) q;
+SELECT 'x' ==> 'e-mail*';
+
 -- REINDEX compacts everything into fresh segments; cached copies must not be reused.
 REINDEX INDEX docs_body_tin;
 SELECT pending_tuples FROM tin_stats('docs_body_tin'::regclass);

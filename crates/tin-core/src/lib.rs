@@ -22,6 +22,7 @@
 pub mod bitmap;
 pub mod cursor;
 pub mod index;
+pub mod pattern;
 pub mod postings;
 pub mod query;
 pub mod segment;
@@ -30,7 +31,7 @@ pub mod tokenize;
 mod varint;
 
 pub use index::Index;
-pub use query::{Plan, Query, QueryError};
+pub use query::{Plan, Query, QueryError, SortedTerms, TermSet};
 pub use segment::{Segment, SegmentBuilder};
 pub use tid::Tid;
 pub use tokenize::Analyzer;
