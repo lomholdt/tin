@@ -31,7 +31,7 @@ The details, including where we deviate from the posts and why, are in:
 
 - [docs/DESIGN.md](docs/DESIGN.md)
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
-- [docs/ROADMAP.md](docs/ROADMAP.md) (next: Phase 2, inserts and deletes)
+- [docs/ROADMAP.md](docs/ROADMAP.md): now aimed at Typesense-style search over ~5M shipping identifiers. Next up: Phase 2, writes.
 
 ## Layout
 
