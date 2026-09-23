@@ -41,7 +41,7 @@ Environment: PostgreSQL 18.6 and Typesense 30.1 on the same 4-vCPU container.
   2. only if none: fragments via `LIKE '%x%'` on `pg_trgm` GIN indexes;
   3. only if still none: typos via `pg_trgm` similarity.
 - **typesense**: default search behaviour (prefix, up to 2 typos) with `infix` enabled on all three fields (`bench/ids/typesense_bench.py`).
-- **tin**: Phase 2, i.e. **exact terms only**, as the starting point.
+- **tin**: Phase 2, i.e. **exact terms only**, as the starting point. (Phase 4 results are [below](#phase-4-prefix-typo-and-fragment-matching).)
 
 **Timing**
 
@@ -98,3 +98,77 @@ Environment: PostgreSQL 18.6 and Typesense 30.1 on the same 4-vCPU container.
 - Typesense-level latency (≤ ~1 ms server time) and hit rate on prefixes and typos.
 - Plain-Postgres-level hit rate on fragments, without the 12–16 ms.
 - All with transactional consistency, and no second system to keep in sync.
+
+## Phase 4: prefix, typo and fragment matching
+
+Same machine, data, queries and timing as above. **tin** now runs the same search box as plain Postgres (`search_tin` in `bench/ids/pg_bench.sql`), on one index built `WITH (grams = true)`:
+
+1. exact (`q`), then prefix (`q* -q`);
+2. only if none: fragments (`*q*`);
+3. only if still none: one typo (`q~`), then two (`q~2`, 7+ characters).
+
+| Query kind | Engine | p50 | p99 | hit@1 | hit@10 | precision@10 | empty |
+|---|---|---:|---:|---:|---:|---:|---:|
+| bl_digits | plain | 15.61 ms | 21.76 ms | 52.6% | 99.8% | 100.0% | 0.0% |
+| bl_digits | tin | 0.60 ms | 0.80 ms | 52.6% | 99.8% | 100.0% | 0.0% |
+| bl_digits | typesense | 8.08 ms | 14.98 ms | 0.1% | 0.3% | 0.5% | 0.0% |
+| equipment_digits | plain | 11.82 ms | 16.77 ms | 36.8% | 76.4% | 100.0% | 0.0% |
+| equipment_digits | tin | 0.47 ms | 2.60 ms | 36.8% | 76.4% | 100.0% | 0.0% |
+| equipment_digits | typesense | 1.94 ms | 5.40 ms | 0.0% | 0.0% | 25.5% | 0.0% |
+| equipment_suffix | plain | 0.22 ms | 9.68 ms | 0.1% | 0.1% | 100.0% | 0.0% |
+| equipment_suffix | tin | 0.34 ms | 1.08 ms | 0.1% | 0.1% | 100.0% | 0.0% |
+| equipment_suffix | typesense | 0.96 ms | 2.02 ms | 0.0% | 0.0% | 79.8% | 0.0% |
+| exact_bl | plain | 0.11 ms | 0.21 ms | 52.8% | 100.0% | 100.0% | 0.0% |
+| exact_bl | tin | 0.15 ms | 0.44 ms | 52.8% | 100.0% | 100.0% | 0.0% |
+| exact_bl | typesense | 0.73 ms | 1.31 ms | 56.6% | 100.0% | 100.0% | 0.0% |
+| exact_booking | plain | 0.11 ms | 0.26 ms | 52.8% | 100.0% | 100.0% | 0.0% |
+| exact_booking | tin | 0.14 ms | 0.40 ms | 52.8% | 100.0% | 100.0% | 0.0% |
+| exact_booking | typesense | 0.66 ms | 1.14 ms | 56.6% | 100.0% | 100.0% | 0.0% |
+| exact_equipment | plain | 0.09 ms | 0.24 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| exact_equipment | tin | 0.14 ms | 0.31 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| exact_equipment | typesense | 0.67 ms | 1.53 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| exact_equipment_lower | plain | 0.09 ms | 0.22 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| exact_equipment_lower | tin | 0.14 ms | 0.29 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| exact_equipment_lower | typesense | 0.68 ms | 1.83 ms | 100.0% | 100.0% | 99.3% | 0.0% |
+| prefix_bl | plain | 0.30 ms | 74.27 ms | 21.9% | 51.6% | 100.0% | 0.0% |
+| prefix_bl | tin | 0.36 ms | 10.07 ms | 21.5% | 51.6% | 100.0% | 0.0% |
+| prefix_bl | typesense | 0.83 ms | 1.53 ms | 22.7% | 51.8% | 100.0% | 0.0% |
+| prefix_equipment | plain | 0.75 ms | 552.65 ms | 22.5% | 35.8% | 100.0% | 0.0% |
+| prefix_equipment | tin | 0.78 ms | 163.23 ms | 22.4% | 35.8% | 100.0% | 0.0% |
+| prefix_equipment | typesense | 0.78 ms | 1.25 ms | 23.1% | 30.9% | 100.0% | 0.0% |
+| typo_equipment | plain | 1193.44 ms | 7979.04 ms | 33.3% | 82.5% | 27.5% | 0.0% |
+| typo_equipment | tin | 2.07 ms | 3.93 ms | 55.5% | 94.7% | 98.8% | 0.0% |
+| typo_equipment | typesense | 1.53 ms | 3.54 ms | 47.9% | 83.4% | 82.0% | 0.0% |
+
+**Reading it**
+
+- **Fragments**: the same rows as plain Postgres (99.8% / 76.4% hit@10, 100% precision), **20–26× faster** (0.47–0.60 ms p50, p99 ≤ 2.6 ms). Typesense still misses them.
+- **Typos**: the best hit rate of the three (**94.7%** hit@10, 98.8% precision vs Typesense's 83.4% / 82.0%) at 2.1 ms p50 / 3.9 ms p99. That's in-server time, while Typesense's 1.5 / 3.5 ms is client time (about 0.5 ms server time).
+  - Likely why: OSA distance counts a swap of neighbours (`…6018200` → `…6012800`) as one edit, and every term within the distance is a candidate.
+- **Exact**: 0.14 ms. That is two index scans (exact, then prefix), vs 0.03 ms for the bare exact lookup in Phase 3.
+- **Short prefixes**: still the gap. prefix_equipment p99 is **163 ms** (plain 553 ms, Typesense 1.25 ms).
+  - A prefix like `MSKU6` matches ~100k distinct numbers, and a bitmap scan must produce all of them before `LIMIT 10` applies.
+  - Phase 5's ordered scan streams matches and stops at k.
+
+**Build and size** (5M rows)
+
+| | Build | Size |
+|---|---:|---:|
+| tin, one index over all three fields, `grams = true` | 91 s | 373 MB |
+| tin, exact terms only (Phase 3) | 39 s | 160 MB |
+| plain: 3 B-trees + 3 `pg_trgm` GINs | — | 688 MB |
+
+**How we got here**
+
+1. **Patterns in tin-core**: prefix (`term*`) expands the FST range into a tuple-space bitmap; typos (`term~`, `~2`) run an optimal-string-alignment automaton over the FST; fragments intersect n-gram terms and are rechecked. Everything is checked against brute force (`cargo test`) and against sequential scans in SQL.
+2. **Planner estimates.** With the stock `contsel` estimate (a flat 0.1%), `WHERE col ==> q LIMIT 10` planned as a *sequential scan*. The planner expected a match every thousand rows, so the seq scan read all 5M rows (**2 s**) whenever q matched one.
+   - `==>` now asks the index for its estimate (`tin_restrict`): exact document frequencies for terms, and sums over matching terms for prefixes and typos.
+   - Where it is unsure, it guesses low: a low guess costs an index scan, a high one a full table scan. Exact queries dropped to 0.14 ms.
+3. **Trigrams → 4-grams.** Identifiers are mostly digits, and there are only 1,000 digit trigrams, so each one is in ~2% of rows. A 7-digit fragment ANDed five lists of ~30k tids per segment (**4.4 ms** in tin-core, 60% of it varint decoding).
+   - There are 10,000 digit 4-grams, so the lists are 10× shorter: **0.29 ms**.
+   - Each term's last gram is padded with an end marker, so every 3-character substring still starts some gram. A 3-character fragment is an exact prefix search over grams.
+   - The index grew 11%.
+4. **Dense grams left out.** For a typo like `msku6018200`, the grams `msku` and `sku6` are in a third of all rows. Intersecting only grams within 10× of the rarest took the fragment tier from 1.3 to 0.48 ms; the recheck drops the few extra candidates.
+5. **Allocation-free typo automaton**: fixed-size DP rows took the typo tier from 0.81 to 0.63 ms (tin-core).
+
+Profile any of this without Postgres with `cargo run --release -p tin-bench --bin ids -- DATA_DIR`. It builds the same segments, runs the same tiers, and prints per-tier latency and candidate counts.

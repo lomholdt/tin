@@ -11,12 +11,17 @@ The core idea: **postings are Postgres ctids stored as two-level bitmaps**, with
 
 ## Status
 
-**Phases 0–1 of 7 are done**: the Rust engine, and a **PostgreSQL 18 index access method** (read-only after `CREATE INDEX` for now).
+**Phases 0–4 are done** (of 0–8): the Rust engine, and a **PostgreSQL 18 index access method** with writes, VACUUM, crash safety, and identifier search: prefix, fragment, and typo-tolerant matching.
 
 ```sql
 CREATE EXTENSION pg_tin;
 CREATE INDEX posts_body_tin ON posts USING tin (body);
 SELECT count(*) FROM posts WHERE body ==> 'grub (uefi OR bios) -windows';
+
+CREATE INDEX shipments_tin ON shipments USING tin (search_text) WITH (grams = true);
+SELECT * FROM shipments WHERE search_text ==> 'msku60*' LIMIT 10;       -- prefix
+SELECT * FROM shipments WHERE search_text ==> '*6018200*' LIMIT 10;     -- fragment
+SELECT * FROM shipments WHERE search_text ==> 'msku6012800~' LIMIT 10;  -- one typo
 ```
 
 | | |
@@ -26,12 +31,13 @@ SELECT count(*) FROM posts WHERE body ==> 'grub (uefi OR bios) -windows';
 | Index size | **19.4% of the text** (TIN post: "roughly 20%" for a minimal index) |
 | Speed (4 threads, COUNT) | 11k–22k queries/s, 1.5–2.4× an uncompressed in-RAM baseline; p99 ≈ 1.4 ms or better |
 | In PostgreSQL 18 vs GIN | build 35.5 s vs 55.8 s; size 157 MB vs 388 MB; median 2.2–2.5× faster on selective queries; index = seqscan on 40/40 sampled queries |
+| 5M shipping IDs vs plain Postgres / Typesense | fragments 0.5–0.6 ms p50 (plain 12–16 ms, same rows; Typesense misses them); typos 2.1 ms p50 at 94.7% hit@10 (Typesense 83.4%, plain 1.2 s); exact 0.14 ms ([details](docs/BENCHMARKS-IDS.md)) |
 
 The details, including where we deviate from the posts and why, are in:
 
 - [docs/DESIGN.md](docs/DESIGN.md)
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
-- [docs/ROADMAP.md](docs/ROADMAP.md): now aimed at Typesense-style search over ~5M shipping identifiers. Next up: Phase 2, writes.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/BENCHMARKS-IDS.md](docs/BENCHMARKS-IDS.md) (identifier search)
+- [docs/ROADMAP.md](docs/ROADMAP.md): aimed at Typesense-style search over ~5M shipping identifiers. Next up: Phase 5, ranked top-k through an ordered index scan.
 
 ## Layout
 
@@ -43,11 +49,15 @@ crates/tin-core    storage format + query engine (library)
   postings.rs      singleton / sparse / two-level-bitmap encodings + readers
   cursor.rs        group-at-a-time AND / OR / NOT over tuple-space bitmaps
   query.rs         query language -> Plan
-  segment.rs       segment build, serialize, search
+  pattern.rs       typo automaton (OSA distance), 4-grams for fragments
+  segment.rs       segment build, serialize, search, row estimates
   index.rs         parallel multi-segment build
-crates/tin-bench   heap-layout simulator, query generator, baseline, report
-crates/pg_tin      PostgreSQL 18 extension (pgrx 0.18): index AM, ==> operator
-scripts/           corpus download + preparation
+crates/tin-bench   heap-layout simulator, query generator, baseline, report;
+                   bin/ids: identifier search without Postgres
+crates/pg_tin      PostgreSQL 18 extension (pgrx 0.18): index AM, ==> operator,
+                   writes / VACUUM, row estimates (tin_restrict)
+bench/ids/         5M-identifier dataset, plain-PG + Typesense baselines, scoring
+scripts/           corpus download + preparation, SQL regression runner
 ```
 
 ## Try it

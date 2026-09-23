@@ -8,7 +8,14 @@ cd data/ids
 psql -f ../../bench/ids/pg_setup.sql                         # table, B-tree, pg_trgm, tin indexes
 psql -c "CREATE TABLE qs (kind text, q text, target bigint)" -c "\copy qs FROM 'queries.tsv'"
 psql -f ../../bench/ids/pg_bench.sql                         # -> pg_results.tsv
+# one engine only: psql -v engines=tin -v out=tin_results.tsv -f ../../bench/ids/pg_bench.sql
 typesense-server --data-dir=ts --api-key=xyz &               # Typesense 30.x
 python3 ../../bench/ids/typesense_bench.py . --load          # -> ts_results.tsv
 python3 ../../bench/ids/evaluate.py . pg_results.tsv ts_results.tsv
+```
+
+Without Postgres (profiling tin-core; caches the built segments in the data dir):
+
+```sh
+cargo run --release -p tin-bench --bin ids -- data/ids [KIND] [REPEAT]
 ```

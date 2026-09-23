@@ -92,9 +92,29 @@ Queries run **group at a time** over a tree of cursors (`Term`, `And`, `Or`, `An
   - Copies of ≤ 57 bits (a single ~13-tuple page) are one unaligned 8-byte load.
 - ✅ Bit operations are plain word loops on aligned arrays. With `-C target-cpu=native`, rustc emits AVX2/AVX-512 and `POPCNT`/`VPOPCNTQ`.
 
-### Query language (Phase 0)
+### Query language
 
 `a b` (AND), `a OR b`, `a -b` / `a NOT b`, parentheses. Keywords are upper-case only. `"phrases"` are rejected until Phase 5. A bare negation (`-a`, `a OR -b`) is an error, because it would need the whole table.
+
+Single-term patterns (Phase 4) combine with all of the above:
+
+| Pattern | Matches terms that | Example |
+|---|---|---|
+| `term*` | start with `term` | `msku60*` |
+| `*frag*` or `*frag` | contain `frag` | `*6018200*` |
+| `term~`, `term~2` | are within 1 (2) edits of `term` | `msku6012800~` |
+
+### Identifier patterns (Phase 4)
+
+- 🔧 **Prefix**: the FST's `starts_with` range. Every matching term's postings are ORed into one tuple-space bitmap per segment (the `Bits` cursor), which then behaves like any other cursor under AND/OR/NOT. Unique IDs are singletons stored in the dictionary value, so expansion reads no postings.
+- 🔧 **Typo**: an automaton over the FST that accepts terms within *k* **optimal-string-alignment** edits: insert, delete, substitute, or swap two neighbours. Plain Levenshtein counts a swap as two edits, and a swapped pair is the most common typo in a typed number. The DP rows are fixed-size arrays, so following an FST edge allocates nothing.
+- 🔧 **Fragments**, with `WITH (grams = true)`:
+  - The index also stores every term's **4-grams**, with the last one padded by an end marker (`\u{2}`). Gram terms start with `\u{1}`, which the analyzer never emits.
+  - A 4+-character fragment is an AND of its own 4-grams. That gives *candidates*: the grams may come from different terms. So those scans return tids with `recheck = true`, and the executor confirms each one with `tin_match`.
+  - Grams more than 10× as frequent as the fragment's rarest are left out of the AND. They cost more to intersect than the few candidates they remove.
+  - A 3-character fragment is an **exact** prefix search over grams (`\u{1}abc…`). The end padding makes every 3-character substring the start of some gram.
+  - Without grams, or under NOT (where a candidate superset would drop real rows), fragments scan the whole dictionary instead.
+  - 🔧 **Why 4-grams, not trigrams** (pg_trgm's choice): identifiers are mostly digits, and there are only 1,000 digit trigrams, so each is in ~2% of rows and a fragment ANDs long lists. With 10,000 digit 4-grams, fragment search was 14× faster at +11% index size.
 
 ## Analyzer
 
@@ -155,10 +175,13 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 - **Bitmap scans only** (`amgetbitmap`, no `amgettuple`), like GIN. Several `==>` conditions are ANDed into one plan.
   - Each segment is searched with its liveness bitmap, which is ANDed per 256-page group in the tuple space.
   - Pending records are matched directly.
-  - Tids go to `tbm_add_tuples` **without recheck**.
+  - Tids go to `tbm_add_tuples` **without recheck**, except for plans with gram-answered fragments (candidates, see above).
 - **Why skipping the recheck is sound**: a dead tuple's bit is cleared before its line pointer can be reused. A backend whose cached liveness predates that VACUUM can only return tids that were dead when its snapshot was taken, and any tuple later placed in a reused slot is invisible to that snapshot. The SQL test forces line-pointer reuse; disabling the liveness filter makes it fail with 2,488 wrong rows.
 - **Sequential scans / rechecks**: `tin_match(doc, query)` uses the same analyzer and `Plan::matches_text`, so both paths return identical rows.
-- **Costing**: `genericcostestimate`, with `contsel` as the operator's selectivity estimate. Real selectivity from document frequencies comes later.
+- **Costing**: `genericcostestimate`, with row estimates from the index itself (`tin_restrict`, the operator's `RESTRICT` function).
+  - It finds the tin index on the clause's column or expression and asks its segments (`Segment::estimate`): exact document frequencies for terms; sums over matching terms for prefixes and typos (at most 1,000 terms read); grams as if independent for fragments; independence for AND / OR / NOT. Pending records are sampled.
+  - When unsure, it errs low. A flat guess (`contsel`, 0.1%) made `WHERE col ==> q LIMIT 10` a sequential scan: the planner expected a match every thousand rows, then read all 5M rows when q matched one.
+  - `tin_match` is declared `COST 10`, since analyzing a row costs about ten simple operators.
 
 ### Known limits
 
@@ -167,4 +190,4 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 
 ## What is not built yet
 
-See the [roadmap](ROADMAP.md): prefix / typo / fragment matching, ranked top-k, and later BM25, phrases, and the visibility-map `COUNT(*)`.
+See the [roadmap](ROADMAP.md): ranked top-k (an ordered index scan that stops at k), the update-storm benchmark, and later BM25, phrases, and the visibility-map `COUNT(*)`.

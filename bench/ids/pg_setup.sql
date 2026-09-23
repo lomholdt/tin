@@ -23,8 +23,8 @@ CREATE INDEX shipments_bl_btree ON shipments (bl_no text_pattern_ops);
 CREATE INDEX shipments_eq_trgm ON shipments USING gin (equipment_no gin_trgm_ops);
 CREATE INDEX shipments_bk_trgm ON shipments USING gin (booking_no gin_trgm_ops);
 CREATE INDEX shipments_bl_trgm ON shipments USING gin (bl_no gin_trgm_ops);
--- tin (exact terms only until Phase 4).
-CREATE INDEX shipments_tin ON shipments USING tin (search_text);
+-- tin: one index over all three fields; grams for fragment search.
+CREATE INDEX shipments_tin ON shipments USING tin (search_text) WITH (grams = true);
 \timing off
 SELECT relname, pg_size_pretty(pg_relation_size(oid)) FROM pg_class
 WHERE relname LIKE 'shipments%' ORDER BY relname;
