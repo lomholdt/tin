@@ -17,8 +17,10 @@ PORT=${PORT:-54329}
 # Postgres refuses to run as root; use the postgres user when we are root.
 AS=""
 if [ "$(id -u)" = 0 ]; then AS="runuser -u postgres --"; chown postgres "$DIR"; fi
-$AS "$BIN/initdb" -D "$DIR/data" -A trust -U postgres >/dev/null
-$AS "$BIN/pg_ctl" -D "$DIR/data" -o "-p $PORT -k $DIR" -l "$DIR/log" -w start >/dev/null
+# Pin encoding + collation, and keep autovacuum from flushing pending lists
+# at random points, so the output is the same on every machine.
+$AS "$BIN/initdb" -D "$DIR/data" -A trust -U postgres -E UTF8 --locale=C >/dev/null
+$AS "$BIN/pg_ctl" -D "$DIR/data" -o "-p $PORT -k $DIR -c autovacuum=off" -l "$DIR/log" -w start >/dev/null
 trap '$AS "$BIN/pg_ctl" -D "$DIR/data" -m immediate stop >/dev/null; rm -rf "$DIR"' EXIT
 
 # Read from stdin so error lines don't embed this machine's path.

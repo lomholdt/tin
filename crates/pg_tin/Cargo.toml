@@ -3,6 +3,7 @@ name = "pg_tin"
 description = "Postgres index access method for tin (pgrx)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [lib]
