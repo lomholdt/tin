@@ -103,7 +103,7 @@ Queries run **group at a time** over a tree of cursors (`Term`, `And`, `Or`, `An
 - Tokens over 64 bytes are dropped: hashes, base64 blobs.
 - Word positions are already produced, for phrases later.
 
-## Postgres integration (Phase 1, `crates/pg_tin`)
+## Postgres integration (`crates/pg_tin`)
 
 A pgrx extension for **PostgreSQL 18**, adding the `tin` index access method, the `==>` operator (`text ==> text`) and the default operator class `text_tin_ops`.
 
@@ -111,39 +111,60 @@ A pgrx extension for **PostgreSQL 18**, adding the `tin` index access method, th
 CREATE EXTENSION pg_tin;
 CREATE INDEX posts_body_tin ON posts USING tin (body);
 SELECT count(*) FROM posts WHERE body ==> 'grub (uefi OR bios) -windows';
+SELECT * FROM tin_stats('posts_body_tin'::regclass);    -- segments, live/pending tuples
+SELECT * FROM tin_segments('posts_body_tin'::regclass); -- one row per segment
+SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending list now
 ```
 
-- **Build (`ambuild`)**:
-  - A serial heap scan through `index_build_range_scan`, with `allow_sync = false` so it starts at block 0 and tids arrive in block order.
-  - HOT chains can report a root offset after higher offsets on the same page, so each page's tuples are buffered and sorted.
-  - A segment is closed at a page boundary once its builder passes `maintenance_work_mem`, written out, and dropped, so memory stays bounded for any table size.
-  - The page directory comes from the tids themselves: the highest offset seen per block.
-- **Storage**:
-  - Block 0 is a metapage (magic, version, segment table).
-  - Each segment's `to_bytes()` follows on consecutive standard pages, 8,168 payload bytes each.
-  - Pages are added with `ExtendBufferedRel` and WAL-logged at the end with `log_newpage_range` (full-page images), which is how GIN logs its build.
-  - Unlogged tables get an empty metapage in the init fork.
-- **Scans**:
-  - Bitmap scans only (`amgetbitmap`, no `amgettuple`), like GIN.
-  - Several `==>` conditions on the column are ANDed into one plan.
-  - Tids go to `tbm_add_tuples` in batches of 4,096, **without recheck**.
-- **Caching**:
-  - Each backend loads the index into memory on first use and keeps it, keyed by `(index OID, relfilenumber)`.
-  - REINDEX, TRUNCATE and VACUUM FULL all create a new relfilenumber, so a stale copy is never read.
-  - 🔧 This is a Phase 1 shortcut. Reading segments straight from shared buffers comes with Phase 3.
-- **Sequential scans / rechecks**: `tin_match(doc, query)` runs the same analyzer and `Plan::matches_text`, so both paths return identical rows (verified on 1.24M rows).
-- **Writes (Phase 1 limitation)**: the index is read-only. `aminsert` raises an error, so inserts and non-HOT updates into an indexed table fail: load first, then `CREATE INDEX`. `ambulkdelete` keeps dead tids. Returning them without recheck is still sound, because:
-  - a dead tuple is dropped by the heap visibility check;
-  - a reused line pointer can only hold a tuple from a failed (aborted) insert, or a heap-only tuple, and a bitmap heap scan never starts a HOT chain from one of those.
+### On disk (format 3)
 
-  Phase 2 adds liveness bitmaps before inserts are allowed.
-- **Costing**: `genericcostestimate`, with `contsel` as the operator's selectivity estimate. Real selectivity from document frequencies is Phase 4.
+- **Block 0**: the metapage, holding a generation counter, the segment table, the pending-list pointers, and the retired chains.
+- **Everything else**: page chains, `[next u32][flags u32][data…]`, used for:
+  - each segment's `to_bytes()`;
+  - each segment's **liveness bitmap**;
+  - the **pending list**.
+- **Page reuse**: chains mean any freed page can be reused through the free space map. A freed page is first stamped `FREE` in a WAL-logged write, and the allocator only takes stamped pages. The FSM isn't WAL-logged and can be stale after a crash, so this check is what makes reuse safe.
+
+### Build (`ambuild`)
+
+- A serial heap scan through `index_build_range_scan`, with `allow_sync = false` so tids arrive in block order.
+- Each page's tuples are sorted first, because HOT chains can report a root offset after higher ones.
+- A segment is closed at a page boundary once its builder passes `maintenance_work_mem`, so memory stays bounded.
+- Pages are written unlogged, then WAL-logged in one pass with `log_newpage_range`, which is how GIN logs its build.
+
+### Writes
+
+- **`aminsert`** analyzes the value and appends a `(tid, sorted distinct terms)` record to the pending list.
+  - It holds the metapage lock exclusively, so inserts into one index are serialized.
+  - The record's last chunk and the metapage update go into the same Generic WAL record.
+- **Flush**: past `tin.pending_list_limit` (default 4 MB), at VACUUM, or on `tin_flush()`, the pending records become a new immutable segment (`SegmentBuilder::add_terms`).
+- **Merges**: segments are grouped by size into tiers (64 kB × 8ᵗ). When 8 segments share a tier they are merged into one (`Segment::merge` drops dead tuples), so the segment count stays logarithmic.
+  - Segments over 64 MB (for example from `CREATE INDEX`) are not merged inline; REINDEX compacts them.
+  - Merged-away chains are *retired*, and only recycled by the next VACUUM's cleanup (see below).
+- **VACUUM (`ambulkdelete`)** asks, for every live bit of every segment, whether that tid is dead, and clears the bits that are. It works in two passes:
+  1. **Without the metapage lock**, so writers keep going: the segments that exist at the start.
+  2. **With the metapage lock held exclusively**: segments flushed or merged in the meantime, plus the pending list, whose dead records are dropped by rewriting it.
+
+  All of this happens before the heap marks the dead line pointers reusable. `amvacuumcleanup` then flushes the pending list and frees retired chains. It's safe to free them there, because the only lock-free reader (pass 1 of *this* VACUUM) has finished, and Postgres runs one VACUUM per table at a time.
+
+### Reads
+
+- **Per-backend cache**, keyed by `(index OID, relfilenumber)`. REINDEX, TRUNCATE and VACUUM FULL change the relfilenumber, so a stale copy is never used. Under a shared metapage lock:
+  - if the generation changed, the backend reloads every liveness bitmap and the whole pending list, and loads any segments it hasn't seen (segments are immutable and reused by id);
+  - otherwise it reads only the new tail of the pending list.
+- **Bitmap scans only** (`amgetbitmap`, no `amgettuple`), like GIN. Several `==>` conditions are ANDed into one plan.
+  - Each segment is searched with its liveness bitmap, which is ANDed per 256-page group in the tuple space.
+  - Pending records are matched directly.
+  - Tids go to `tbm_add_tuples` **without recheck**.
+- **Why skipping the recheck is sound**: a dead tuple's bit is cleared before its line pointer can be reused. A backend whose cached liveness predates that VACUUM can only return tids that were dead when its snapshot was taken, and any tuple later placed in a reused slot is invisible to that snapshot. The SQL test forces line-pointer reuse; disabling the liveness filter makes it fail with 2,488 wrong rows.
+- **Sequential scans / rechecks**: `tin_match(doc, query)` uses the same analyzer and `Plan::matches_text`, so both paths return identical rows.
+- **Costing**: `genericcostestimate`, with `contsel` as the operator's selectivity estimate. Real selectivity from document frequencies comes later.
+
+### Known limits
+
+- Inserts into one index are serialized on the metapage lock, and a merge runs inline in whichever insert triggers it.
+- The first query in a new backend copies the index into that backend's memory. Background merges and zero-copy reads from shared buffers are Phase 7.
 
 ## What is not built yet
 
-These are all on the [roadmap](ROADMAP.md):
-
-- Writes: inserts/updates into indexed tables, liveness bitmaps, the visibility-map `COUNT(*)` shortcut.
-- Mutable segments and merges.
-- BM25: term frequencies, document lengths, block-max top-k.
-- Phrases/spans, fuzzy/wildcard/regex.
+See the [roadmap](ROADMAP.md): prefix / typo / fragment matching, ranked top-k, and later BM25, phrases, and the visibility-map `COUNT(*)`.

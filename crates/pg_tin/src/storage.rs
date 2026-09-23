@@ -1,33 +1,34 @@
-//! Index relation layout (format 2).
+//! Index relation layout (format 3).
 //!
 //! ```text
-//! block 0   metapage: generation, segment table, pending-list pointers
-//! segment   Segment::to_bytes() on consecutive pages (8168 payload bytes each)
-//! liveness  per segment: its liveness bitmap (u64 LE words) on consecutive pages
-//! pending   chain of pages holding records of tuples inserted since the
-//!           last flush: [next u32][flags u32][stream bytes…]
+//! block 0   metapage: generation, segment table, pending-list pointers,
+//!           retired page chains
+//! blobs     every other page belongs to a chain: [next u32][flags u32][data…]
+//!   segment   Segment::to_bytes() split across a chain (8160 data bytes/page)
+//!   liveness  per segment: its liveness bitmap (u64 LE words) on a chain
+//!   pending   records of tuples inserted since the last flush
 //! ```
 //!
-//! Segment and liveness pages are only ever added by extending the relation,
-//! so each blob is contiguous. Pending pages come from the free space map
-//! when possible and go back to it after a flush; a freed page is first
-//! stamped (WAL-logged) so a stale FSM entry can never hand out a live page.
+//! Chains let any freed page be reused for anything: pages come from the free
+//! space map when possible, otherwise the relation is extended. A freed page
+//! is first stamped (WAL-logged) so a stale FSM entry can never hand out a
+//! page still in use.
 //!
 //! Every page is a standard Postgres page (payload below `pd_lower`). The
 //! build writes unlogged and WAL-logs the whole relation once at the end
 //! (`log_newpage_range`); every later change goes through Generic WAL.
 //!
-//! Concurrency: structural changes (pending appends, flushes, the last phase
-//! of VACUUM) hold the metapage buffer lock exclusively. Readers hold it
-//! shared while they read the metapage and the pending list, so pending pages
-//! can't be recycled under them. Segment pages never change; liveness pages
-//! only ever have bits cleared (see `scan.rs` for why that is safe to observe
-//! at any moment).
+//! Concurrency: structural changes (pending appends, flushes, merges, the
+//! last phase of VACUUM) hold the metapage buffer lock exclusively. Readers
+//! hold it shared while they read the metapage, liveness, the pending list
+//! and any newly needed segment. Merged-away segments are *retired* rather
+//! than freed and only recycled by the next VACUUM's cleanup, because
+//! VACUUM's first pass reads segments without the metapage lock.
 
 use pgrx::pg_sys;
 
 const META_MAGIC: u32 = u32::from_le_bytes(*b"TIN1");
-const META_VERSION: u32 = 2;
+const META_VERSION: u32 = 3;
 /// `SizeOfPageHeaderData`, already MAXALIGNed.
 const PAGE_HEADER: usize = 24;
 const BLCKSZ: usize = pg_sys::BLCKSZ as usize;
@@ -36,8 +37,11 @@ const META_HEADER: usize = 64;
 const META_ENTRY: usize = 32;
 /// Segments that fit in the metapage's table.
 pub const MAX_SEGMENTS: usize = (PAGE_PAYLOAD - META_HEADER) / META_ENTRY;
-const PENDING_HEADER: usize = 8;
-const PENDING_CAP: usize = PAGE_PAYLOAD - PENDING_HEADER;
+/// Chain page header: next block, flags.
+const CHAIN_HEADER: usize = 8;
+const CHAIN_CAP: usize = PAGE_PAYLOAD - CHAIN_HEADER;
+const PENDING_HEADER: usize = CHAIN_HEADER;
+const PENDING_CAP: usize = CHAIN_CAP;
 const INVALID_BLOCK: u32 = u32::MAX;
 /// Flags word of a pending page that has been freed.
 const FREED: u32 = u32::from_le_bytes(*b"FREE");
@@ -68,6 +72,10 @@ pub struct Meta {
     pub pending_bytes: u64,
     pub pending_count: u64,
     pub segments: Vec<SegmentRef>,
+    /// Chains (head, pages) of merged-away segments and their liveness.
+    /// Freed by the next VACUUM, so a concurrent VACUUM's lock-free pass
+    /// never reads a recycled page.
+    pub retired: Vec<(u32, u32)>,
 }
 
 impl Meta {
@@ -81,11 +89,22 @@ impl Meta {
             pending_bytes: 0,
             pending_count: 0,
             segments: Vec::new(),
+            retired: Vec::new(),
         }
     }
 
+    /// Whether one more segment entry fits in the metapage.
+    pub fn can_add_segment(&self) -> bool {
+        META_HEADER + (self.segments.len() + 1) * META_ENTRY + self.retired.len() * 8 <= PAGE_PAYLOAD
+    }
+
+    /// Whether the encoded metapage fits in one page.
+    pub fn fits(&self) -> bool {
+        META_HEADER + self.segments.len() * META_ENTRY + self.retired.len() * 8 <= PAGE_PAYLOAD
+    }
+
     fn encode(&self) -> Vec<u8> {
-        assert!(self.segments.len() <= MAX_SEGMENTS, "too many segments for the metapage");
+        assert!(self.fits(), "metapage overflow");
         let mut out = Vec::with_capacity(META_HEADER + self.segments.len() * META_ENTRY);
         out.extend_from_slice(&META_MAGIC.to_le_bytes());
         out.extend_from_slice(&META_VERSION.to_le_bytes());
@@ -96,7 +115,7 @@ impl Meta {
             self.pending_head,
             self.pending_tail,
             self.pending_tail_used,
-            0,
+            self.retired.len() as u32,
         ] {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -108,6 +127,10 @@ impl Meta {
                 out.extend_from_slice(&v.to_le_bytes());
             }
             out.extend_from_slice(&s.len.to_le_bytes());
+        }
+        for (first, n) in &self.retired {
+            out.extend_from_slice(&first.to_le_bytes());
+            out.extend_from_slice(&n.to_le_bytes());
         }
         out
     }
@@ -124,8 +147,9 @@ impl Meta {
                 u32_at(4)
             );
         }
-        let n = if b.len() >= META_HEADER { u32_at(20) as usize } else { usize::MAX };
-        if n == usize::MAX || b.len() < META_HEADER + n * META_ENTRY {
+        let (n, n_retired) =
+            if b.len() >= META_HEADER { (u32_at(20) as usize, u32_at(36) as usize) } else { (usize::MAX, 0) };
+        if n == usize::MAX || b.len() < META_HEADER + n * META_ENTRY + n_retired * 8 {
             pgrx::error!("tin: index metapage is truncated");
         }
         let segments = (0..n)
@@ -141,7 +165,11 @@ impl Meta {
                 }
             })
             .collect();
+        let retired_at = META_HEADER + n * META_ENTRY;
+        let retired =
+            (0..n_retired).map(|i| (u32_at(retired_at + i * 8), u32_at(retired_at + i * 8 + 4))).collect();
         Meta {
+            retired,
             generation: u64_at(8),
             next_segment_id: u32_at(16),
             pending_head: u32_at(24),
@@ -224,9 +252,9 @@ unsafe fn extend(index: pg_sys::Relation, fork: pg_sys::ForkNumber::Type) -> Loc
     Locked(pg_sys::ExtendBufferedRel(bmr, fork, std::ptr::null_mut(), flags))
 }
 
-/// A page for the pending list: a freed page from the free space map if one
-/// checks out, otherwise a new one. Exclusively locked, contents undefined.
-unsafe fn alloc_pending_page(index: pg_sys::Relation) -> Locked {
+/// A page for a chain: a freed page from the free space map if one checks
+/// out, otherwise a new one. Exclusively locked, contents undefined.
+unsafe fn alloc_page(index: pg_sys::Relation) -> Locked {
     loop {
         let blk = pg_sys::GetFreeIndexPage(index);
         if blk == INVALID_BLOCK {
@@ -294,27 +322,52 @@ pub unsafe fn init_metapage(index: pg_sys::Relation) {
     pg_sys::MarkBufferDirty(buf.0);
 }
 
-/// Append `bytes` as consecutive new pages; returns (first block, count).
+/// Write `bytes` as a new page chain; returns (head block, pages).
 /// `wal`: log each page now (runtime) or leave it to `log_all_pages` (build).
 pub unsafe fn write_blob(index: pg_sys::Relation, bytes: &[u8], wal: bool) -> (u32, u32) {
-    let mut first = None;
+    let mut head = INVALID_BLOCK;
     let mut n = 0u32;
-    for chunk in bytes.chunks(PAGE_PAYLOAD) {
-        let buf = extend(index, pg_sys::ForkNumber::MAIN_FORKNUM);
-        let blk = pg_sys::BufferGetBlockNumber(buf.0);
-        match first {
-            Some(f) => assert_eq!(blk, f + n, "blob pages must be consecutive"),
-            None => first = Some(blk),
-        }
+    let mut prev: Option<Locked> = None;
+    for chunk in bytes.chunks(CHAIN_CAP) {
+        let page = alloc_page(index);
+        let blk = pg_sys::BufferGetBlockNumber(page.0);
+        let mut payload = chain_header(INVALID_BLOCK, 0).to_vec();
+        payload.extend_from_slice(chunk);
         if wal {
-            logged(index, &[(&buf, true)], |p| init_page(p[0], chunk));
+            match &prev {
+                Some(p) => logged(index, &[(p, false), (&page, true)], |pp| {
+                    write_at(pp[0], 0, &blk.to_le_bytes());
+                    init_page(pp[1], &payload);
+                }),
+                None => logged(index, &[(&page, true)], |pp| init_page(pp[0], &payload)),
+            }
         } else {
-            init_page(pg_sys::BufferGetPage(buf.0), chunk);
-            pg_sys::MarkBufferDirty(buf.0);
+            if let Some(p) = &prev {
+                write_at(pg_sys::BufferGetPage(p.0), 0, &blk.to_le_bytes());
+                pg_sys::MarkBufferDirty(p.0);
+            }
+            init_page(pg_sys::BufferGetPage(page.0), &payload);
+            pg_sys::MarkBufferDirty(page.0);
         }
+        if prev.is_none() {
+            head = blk;
+        }
+        prev = Some(page);
         n += 1;
     }
-    (first.unwrap_or(INVALID_BLOCK), n)
+    (head, n)
+}
+
+/// Blocks of the `n`-page chain starting at `head`.
+pub unsafe fn chain_blocks(index: pg_sys::Relation, head: u32, n: u32) -> Vec<u32> {
+    let mut blocks = Vec::with_capacity(n as usize);
+    let mut blk = head;
+    for _ in 0..n {
+        blocks.push(blk);
+        let buf = read_locked(index, blk, pg_sys::BUFFER_LOCK_SHARE);
+        blk = u32_in_payload(pg_sys::BufferGetPage(buf.0), 0);
+    }
+    blocks
 }
 
 /// Write the metapage during a build (no WAL).
@@ -344,16 +397,19 @@ pub unsafe fn write_empty_init_fork(index: pg_sys::Relation) {
 
 // --- Segments and liveness ---------------------------------------------------------
 
-/// Concatenated payloads of `n` pages starting at `first`.
-pub unsafe fn read_blob(index: pg_sys::Relation, first: u32, n: u32, len: u64) -> Vec<u8> {
+/// The data of the `n`-page chain starting at `head` (`len` bytes).
+pub unsafe fn read_blob(index: pg_sys::Relation, head: u32, n: u32, len: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(len as usize);
-    for blk in first..first + n {
+    let mut blk = head;
+    for _ in 0..n {
         let buf = read_locked(index, blk, pg_sys::BUFFER_LOCK_SHARE);
         let page = pg_sys::BufferGetPage(buf.0);
-        out.extend_from_slice(std::slice::from_raw_parts(payload_ptr(page), payload_len(page)));
+        let data = payload_len(page).saturating_sub(CHAIN_HEADER);
+        out.extend_from_slice(std::slice::from_raw_parts(payload_ptr(page).add(CHAIN_HEADER), data));
+        blk = u32_in_payload(page, 0);
     }
     if out.len() as u64 != len {
-        pgrx::error!("tin: blob at block {first} is {} bytes, expected {len}", out.len());
+        pgrx::error!("tin: page chain at block {head} holds {} bytes, expected {len}", out.len());
     }
     out
 }
@@ -368,17 +424,19 @@ pub unsafe fn read_liveness(index: pg_sys::Relation, seg: &SegmentRef, words: us
     bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
-/// Write the pages of `seg`'s liveness bitmap that differ between `old` and
-/// `new`, one Generic WAL record each.
+/// Rewrite the pages of `seg`'s liveness chain whose words differ between
+/// `old` and `new`, one Generic WAL record each.
 pub unsafe fn update_liveness(index: pg_sys::Relation, seg: &SegmentRef, old: &[u64], new: &[u64]) {
-    const WORDS_PER_PAGE: usize = PAGE_PAYLOAD / 8;
-    for (i, (o, n)) in old.chunks(WORDS_PER_PAGE).zip(new.chunks(WORDS_PER_PAGE)).enumerate() {
-        if o == n {
-            continue;
+    const WORDS_PER_PAGE: usize = CHAIN_CAP / 8;
+    let mut blk = seg.live_first;
+    for (o, n) in old.chunks(WORDS_PER_PAGE).zip(new.chunks(WORDS_PER_PAGE)) {
+        let buf = read_locked(index, blk, pg_sys::BUFFER_LOCK_EXCLUSIVE);
+        let next = u32_in_payload(pg_sys::BufferGetPage(buf.0), 0);
+        if o != n {
+            let bytes = words_to_bytes(n);
+            logged(index, &[(&buf, false)], |p| write_at(p[0], CHAIN_HEADER, &bytes));
         }
-        let buf = read_locked(index, seg.live_first + i as u32, pg_sys::BUFFER_LOCK_EXCLUSIVE);
-        let bytes = words_to_bytes(n);
-        logged(index, &[(&buf, false)], |p| write_at(p[0], 0, &bytes));
+        blk = next;
     }
 }
 
@@ -398,8 +456,8 @@ impl PendingPos {
     }
 }
 
-fn pending_header(next: u32, flags: u32) -> [u8; PENDING_HEADER] {
-    let mut h = [0u8; PENDING_HEADER];
+fn chain_header(next: u32, flags: u32) -> [u8; CHAIN_HEADER] {
+    let mut h = [0u8; CHAIN_HEADER];
     h[..4].copy_from_slice(&next.to_le_bytes());
     h[4..].copy_from_slice(&flags.to_le_bytes());
     h
@@ -453,9 +511,9 @@ pub unsafe fn pending_blocks(index: pg_sys::Relation, meta: &Meta) -> Vec<u32> {
 /// chunk. Caller holds `lock` (the metapage) exclusively.
 pub unsafe fn append_pending(index: pg_sys::Relation, lock: &MetaLock, meta: &mut Meta, record: &[u8]) {
     if meta.pending_head == INVALID_BLOCK {
-        let page = alloc_pending_page(index);
+        let page = alloc_page(index);
         let blk = pg_sys::BufferGetBlockNumber(page.0);
-        logged(index, &[(&page, true)], |p| init_page(p[0], &pending_header(INVALID_BLOCK, 0)));
+        logged(index, &[(&page, true)], |p| init_page(p[0], &chain_header(INVALID_BLOCK, 0)));
         meta.pending_head = blk;
         meta.pending_tail = blk;
         meta.pending_tail_used = 0;
@@ -466,11 +524,11 @@ pub unsafe fn append_pending(index: pg_sys::Relation, lock: &MetaLock, meta: &mu
             // Tail is full: link a fresh page. (A crash after this but before
             // the metapage update only leaks the new page.)
             let tail = read_locked(index, meta.pending_tail, pg_sys::BUFFER_LOCK_EXCLUSIVE);
-            let page = alloc_pending_page(index);
+            let page = alloc_page(index);
             let blk = pg_sys::BufferGetBlockNumber(page.0);
             logged(index, &[(&tail, false), (&page, true)], |p| {
                 write_at(p[0], 0, &blk.to_le_bytes());
-                init_page(p[1], &pending_header(INVALID_BLOCK, 0));
+                init_page(p[1], &chain_header(INVALID_BLOCK, 0));
             });
             meta.pending_tail = blk;
             meta.pending_tail_used = 0;
@@ -505,9 +563,9 @@ pub unsafe fn rewrite_pending(index: pg_sys::Relation, meta: &mut Meta, stream: 
     meta.pending_count = 0;
     let mut prev: Option<Locked> = None;
     for chunk in stream.chunks(PENDING_CAP) {
-        let page = alloc_pending_page(index);
+        let page = alloc_page(index);
         let blk = pg_sys::BufferGetBlockNumber(page.0);
-        let mut payload = pending_header(INVALID_BLOCK, 0).to_vec();
+        let mut payload = chain_header(INVALID_BLOCK, 0).to_vec();
         payload.extend_from_slice(chunk);
         match &prev {
             Some(p) => logged(index, &[(p, false), (&page, true)], |pp| {
@@ -528,14 +586,15 @@ pub unsafe fn rewrite_pending(index: pg_sys::Relation, meta: &mut Meta, stream: 
 }
 
 /// Stamp pages as freed (WAL-logged) and hand them to the free space map.
-pub unsafe fn free_pending_pages(index: pg_sys::Relation, blocks: &[u32]) {
+/// Only pending pages are ever taken back out (see `alloc_pending_page`).
+pub unsafe fn free_pages(index: pg_sys::Relation, blocks: &[u32]) {
     for chunk in blocks.chunks(4) {
         let bufs: Vec<Locked> =
             chunk.iter().map(|&b| read_locked(index, b, pg_sys::BUFFER_LOCK_EXCLUSIVE)).collect();
         let regs: Vec<(&Locked, bool)> = bufs.iter().map(|b| (b, true)).collect();
         logged(index, &regs, |pages| {
             for &p in pages {
-                init_page(p, &pending_header(INVALID_BLOCK, FREED));
+                init_page(p, &chain_header(INVALID_BLOCK, FREED));
             }
         });
     }

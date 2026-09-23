@@ -343,3 +343,49 @@ fn add_terms_and_overlapping_segments() {
         assert_eq!(idx.count(&plan), want.len() as u64);
     }
 }
+
+#[test]
+fn merge_keeps_only_live_tuples() {
+    let c = corpus(55);
+    let mut a = Analyzer::new();
+    // Three overlapping segments (round-robin), each with some deletions.
+    let mut builders: Vec<SegmentBuilder> = (0..3).map(|_| SegmentBuilder::open_ended(0)).collect();
+    for (i, (tid, text)) in c.docs.iter().enumerate() {
+        let terms = a.unique_terms(text);
+        builders[i % 3].add_terms(*tid, terms.iter().map(|s| s.as_str()));
+    }
+    let segs: Vec<Segment> = builders.into_iter().map(|b| b.finish()).collect();
+    let mut rng = Rng(56);
+    let mut dead = BTreeSet::new();
+    let lives: Vec<Vec<u64>> = segs
+        .iter()
+        .map(|s| {
+            let mut live = s.docs().to_vec();
+            s.for_each_set_tid(s.docs(), |bit, tid| {
+                if rng.chance(0.4) {
+                    live[(bit >> 6) as usize] &= !(1 << (bit & 63));
+                    dead.insert(tid);
+                }
+            });
+            live
+        })
+        .collect();
+    let inputs: Vec<(&Segment, Option<&[u64]>)> =
+        segs.iter().zip(&lives).map(|(s, l)| (s, Some(l.as_slice()))).collect();
+    let merged = Segment::merge(&inputs).unwrap();
+    assert_eq!(merged.meta().doc_count as usize, c.docs.len() - dead.len());
+
+    // Serialization still round-trips after a merge.
+    let merged = Segment::from_bytes(&merged.to_bytes()).unwrap();
+    let idx = Index::from_segments(vec![merged]);
+    for _ in 0..300 {
+        let plan = random_plan(&mut rng, 3);
+        let want: Vec<Tid> = eval(&plan, &c.truth).into_iter().filter(|t| !dead.contains(t)).collect();
+        assert_eq!(idx.search_vec(&plan), want, "{plan:?}");
+    }
+    // Everything deleted: nothing to merge.
+    let empty: Vec<Vec<u64>> = segs.iter().map(|s| vec![0; s.docs().len()]).collect();
+    let inputs: Vec<(&Segment, Option<&[u64]>)> =
+        segs.iter().zip(&empty).map(|(s, l)| (s, Some(l.as_slice()))).collect();
+    assert!(Segment::merge(&inputs).is_none());
+}

@@ -8,7 +8,7 @@ use tin_core::{Analyzer, SegmentBuilder, Tid};
 
 use crate::pending;
 use crate::scan;
-use crate::storage::{self, Meta, MetaLock, PendingPos, SegmentRef, MAX_SEGMENTS};
+use crate::storage::{self, Meta, MetaLock, PendingPos, SegmentRef};
 
 /// `tin.pending_list_limit` (kB): flush the pending list into a new segment
 /// once it grows past this.
@@ -49,11 +49,12 @@ pub unsafe fn flush_locked(index: pg_sys::Relation, lock: &MetaLock, meta: &mut 
     if meta.pending_count == 0 {
         return 0;
     }
-    if meta.segments.len() >= MAX_SEGMENTS {
-        // Merges come in a later phase; until then the pending list keeps
-        // growing (still correct, just slower) and REINDEX compacts.
+    if !meta.can_add_segment() {
+        // Only reachable with many large (unmergeable) segments plus pages
+        // waiting for VACUUM: the pending list keeps growing (still correct,
+        // just slower) until VACUUM or REINDEX makes room.
         warning!(
-            "tin: index \"{}\" has {MAX_SEGMENTS} segments; REINDEX it to compact",
+            "tin: index \"{}\" has no room for another segment; VACUUM or REINDEX it",
             crate::build::name_of(index)
         );
         return 0;
@@ -83,10 +84,97 @@ pub unsafe fn flush_locked(index: pg_sys::Relation, lock: &MetaLock, meta: &mut 
     });
     meta.next_segment_id += 1;
     storage::rewrite_pending(index, meta, &[], 0);
+    merge_small_segments(index, meta);
     meta.generation += 1;
     lock.write(index, meta);
-    storage::free_pending_pages(index, &old_pages);
+    storage::free_pages(index, &old_pages);
+    pg_sys::IndexFreeSpaceMapVacuum(index);
     records.len() as u64
+}
+
+/// Size tiers for merging: a segment of `len` bytes is in tier
+/// `log8(len / 64 kB)`. Whenever [`MERGE_FACTOR`] segments share a tier they
+/// are merged into one (which lands a tier up), so the segment count stays
+/// logarithmic in the number of flushes. Segments above
+/// [`MERGE_MAX_BYTES`] (e.g. from `CREATE INDEX`) are left alone; merging
+/// them inline would stall writers. REINDEX compacts everything.
+const MERGE_FACTOR: usize = 8;
+const TIER_BASE: u64 = 64 * 1024;
+const MERGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+fn tier(len: u64) -> u32 {
+    let mut t = 0;
+    let mut cap = TIER_BASE;
+    while len > cap {
+        cap *= 8;
+        t += 1;
+    }
+    t
+}
+
+/// Merge full tiers of small segments. Caller holds the metapage
+/// exclusively; `meta` is updated in memory (caller writes it).
+unsafe fn merge_small_segments(index: pg_sys::Relation, meta: &mut Meta) {
+    loop {
+        let mut by_tier: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+        for (i, r) in meta.segments.iter().enumerate() {
+            if r.len <= MERGE_MAX_BYTES {
+                by_tier.entry(tier(r.len)).or_default().push(i);
+            }
+        }
+        let Some(group) = by_tier.into_values().find(|v| v.len() >= MERGE_FACTOR) else {
+            return;
+        };
+        let group: Vec<SegmentRef> = group.into_iter().take(MERGE_FACTOR).map(|i| meta.segments[i]).collect();
+
+        let segs: Vec<tin_core::Segment> = group.iter().map(|r| scan::load_segment(index, r)).collect();
+        let lives: Vec<Vec<u64>> = group
+            .iter()
+            .zip(&segs)
+            .map(|(r, s)| storage::read_liveness(index, r, scan::live_words(s)))
+            .collect();
+        let inputs: Vec<(&tin_core::Segment, Option<&[u64]>)> =
+            segs.iter().zip(&lives).map(|(s, l)| (s, Some(l.as_slice()))).collect();
+        let merged = tin_core::Segment::merge(&inputs);
+
+        let ids: HashSet<u32> = group.iter().map(|r| r.id).collect();
+        meta.segments.retain(|r| !ids.contains(&r.id));
+        for r in &group {
+            meta.retired.push((r.first_block, r.n_blocks));
+            meta.retired.push((r.live_first, r.live_blocks));
+        }
+        if let Some(seg) = merged {
+            let bytes = seg.to_bytes();
+            let (first_block, n_blocks) = storage::write_blob(index, &bytes, true);
+            let (live_first, live_blocks) =
+                storage::write_blob(index, &storage::words_to_bytes(seg.docs()), true);
+            meta.segments.push(SegmentRef {
+                id: meta.next_segment_id,
+                first_block,
+                n_blocks,
+                len: bytes.len() as u64,
+                live_first,
+                live_blocks,
+            });
+            meta.next_segment_id += 1;
+        }
+        debug_assert!(meta.fits());
+    }
+}
+
+/// Free the pages of merged-away segments. Only called from VACUUM's
+/// cleanup, after its own lock-free pass has finished.
+unsafe fn free_retired(index: pg_sys::Relation) {
+    let lock = MetaLock::exclusive(index);
+    let mut meta = lock.read();
+    if meta.retired.is_empty() {
+        return;
+    }
+    let blocks: Vec<u32> =
+        meta.retired.iter().flat_map(|&(head, n)| storage::chain_blocks(index, head, n)).collect();
+    meta.retired.clear();
+    lock.write(index, &meta);
+    storage::free_pages(index, &blocks);
 }
 
 /// `SELECT tin_flush('idx'::regclass)`: flush the pending list now.
@@ -176,7 +264,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     // Always bump: liveness pages changed, and backends must reload them.
     meta.generation += 1;
     lock.write(index, &meta);
-    storage::free_pending_pages(index, &old_pages);
+    storage::free_pages(index, &old_pages);
     drop(lock);
 
     (*stats).tuples_removed += acc.removed;
@@ -195,6 +283,7 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
         return stats;
     }
     flush(index);
+    free_retired(index);
     pg_sys::IndexFreeSpaceMapVacuum(index);
     let stats = if stats.is_null() {
         let s = PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0().into_pg();

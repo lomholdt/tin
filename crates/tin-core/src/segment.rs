@@ -188,46 +188,125 @@ impl SegmentBuilder {
         let mut order: Vec<u32> = (0..self.terms.len() as u32).collect();
         order.sort_unstable_by(|&a, &b| self.terms[a as usize].cmp(&self.terms[b as usize]));
 
-        let mut dict = MapBuilder::memory();
-        let mut postings = Vec::new();
-        let mut enc = Encoder::default();
-        let dir = PageDir::new(self.first_block, &self.widths);
-        let mut posting_count = 0u64;
+        let mut asm = Assembler::new(self.first_block, self.widths);
         let mut stats: BTreeMap<(C, Encoding), ClassStats> = BTreeMap::new();
         for id in order {
             let tids = &self.postings[id as usize];
-            posting_count += tids.len() as u64;
-            let e = enc.encode_term(tids, dir, &mut postings);
+            let e = asm.push(self.terms[id as usize].as_bytes(), tids);
             *stats.entry((class_of(tids.len() as u64, self.doc_count), e.encoding)).or_default() +=
                 ClassStats { terms: 1, postings: tids.len() as u64, bytes: e.bytes as u64 };
-            dict.insert(self.terms[id as usize].as_bytes(), e.value).expect("terms are unique and sorted");
         }
-        let dict = Map::new(dict.into_inner().expect("fst build")).expect("fst load");
-        postings.resize(postings.len() + TAIL_PADDING, 0);
+        (asm.finish(self.end_block, &self.docs), stats)
+    }
+}
 
+/// Encodes terms (pushed in sorted order) into a segment over a known page
+/// directory. Shared by fresh builds and merges.
+struct Assembler {
+    first_block: u32,
+    widths: Vec<u16>,
+    dict: MapBuilder<Vec<u8>>,
+    postings: Vec<u8>,
+    enc: Encoder,
+    posting_count: u64,
+    term_count: u64,
+}
+
+impl Assembler {
+    fn new(first_block: u32, widths: Vec<u16>) -> Self {
+        Assembler {
+            first_block,
+            widths,
+            dict: MapBuilder::memory(),
+            postings: Vec::new(),
+            enc: Encoder::default(),
+            posting_count: 0,
+            term_count: 0,
+        }
+    }
+
+    /// Add a term; terms must arrive in strictly ascending byte order and
+    /// `tids` must be strictly ascending and non-empty.
+    fn push(&mut self, term: &[u8], tids: &[Tid]) -> crate::postings::Encoded {
+        let dir = PageDir::new(self.first_block, &self.widths);
+        let e = self.enc.encode_term(tids, dir, &mut self.postings);
+        self.dict.insert(term, e.value).expect("terms are unique and sorted");
+        self.posting_count += tids.len() as u64;
+        self.term_count += 1;
+        e
+    }
+
+    /// `docs`: every indexed tid (any order).
+    fn finish(self, end_block: u32, docs: &[Tid]) -> Segment {
+        let dict = Map::new(self.dict.into_inner().expect("fst build")).expect("fst load");
+        let mut postings = self.postings;
+        postings.resize(postings.len() + TAIL_PADDING, 0);
         let block_start = block_starts(&self.widths);
-        let mut docs = vec![0u64; (*block_start.last().unwrap() as usize).div_ceil(64)];
-        for t in &self.docs {
+        let mut doc_bits = vec![0u64; (*block_start.last().unwrap() as usize).div_ceil(64)];
+        for t in docs {
             let bit = block_start[(t.block - self.first_block) as usize] as usize + t.offset_bit() as usize;
-            docs[bit >> 6] |= 1 << (bit & 63);
+            doc_bits[bit >> 6] |= 1 << (bit & 63);
         }
         let spaces = SpaceTable::new(PageDir::new(self.first_block, &self.widths));
-        let segment = Segment {
+        Segment {
             spaces,
             block_start,
-            docs,
+            docs: doc_bits,
             meta: SegmentMeta {
                 first_block: self.first_block,
-                end_block: self.end_block,
-                doc_count: self.doc_count,
-                term_count: self.terms.len() as u64,
-                posting_count,
+                end_block,
+                doc_count: docs.len() as u64,
+                term_count: self.term_count,
+                posting_count: self.posting_count,
             },
             widths: self.widths,
             dict,
             postings,
-        };
-        (segment, stats)
+        }
+    }
+}
+
+impl Segment {
+    /// Merge segments into one that holds only their live tuples. Each input
+    /// comes with its liveness bitmap (`None` = all of its docs). Tuples may
+    /// interleave across inputs but each tid must live in only one of them.
+    /// Returns `None` if nothing is live.
+    pub fn merge(inputs: &[(&Segment, Option<&[u64]>)]) -> Option<Segment> {
+        let mut docs = Vec::new();
+        for (seg, live) in inputs {
+            seg.for_each_set_tid(live.unwrap_or(seg.docs()), |_, t| docs.push(t));
+        }
+        docs.sort_unstable();
+        docs.dedup();
+        let first_block = docs.first()?.block;
+        let end_block = docs.last().unwrap().block + 1;
+        let mut widths = vec![0u16; (end_block - first_block) as usize];
+        for t in &docs {
+            let w = &mut widths[(t.block - first_block) as usize];
+            *w = (*w).max(t.offset);
+        }
+
+        let mut asm = Assembler::new(first_block, widths);
+        let mut op = fst::map::OpBuilder::new();
+        for (seg, _) in inputs {
+            op = op.add(&seg.dict);
+        }
+        let mut union = op.union();
+        let mut tids = Vec::new();
+        while let Some((term, values)) = union.next() {
+            tids.clear();
+            for v in values {
+                let (seg, live) = inputs[v.index];
+                let mut c = TermPostings::from_value(v.value, &seg.postings).cursor();
+                cursor::for_each_tid(c.as_mut(), &seg.spaces, live, |t| tids.push(t));
+            }
+            if tids.is_empty() {
+                continue; // every tuple with this term was deleted
+            }
+            tids.sort_unstable();
+            asm.push(term, &tids);
+        }
+        Some(asm.finish(end_block, &docs))
     }
 }
 

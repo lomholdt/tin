@@ -25,8 +25,8 @@ Long-text ranking (BM25, phrases) and TIN-style big-corpus benchmarks still matt
 |---|---|---|---|
 | 0 | Core engine (Rust): tokenizer, dictionary, two-level bitmaps, AND/OR/NOT, COUNT | Correct on real data + first speed numbers | ✅ done |
 | 1 | PostgreSQL 18 index access method (read-only) | `CREATE INDEX … USING tin`; `WHERE col ==> 'q'`; index = seqscan | ✅ done |
-| 2 | **Writes** | INSERT / UPDATE / DELETE / VACUUM correct under concurrency and after `kill -9`; index = seqscan | next |
-| 3 | **Identifier dataset + baselines** | 5M synthetic container / booking / B/L numbers; B-tree + `pg_trgm` (+ Typesense) latency and recall measured | |
+| 2 | **Writes** | INSERT / UPDATE / DELETE / VACUUM correct under concurrency and after `kill -9`; index = seqscan | ✅ done |
+| 3 | **Identifier dataset + baselines** | 5M synthetic container / booking / B/L numbers; B-tree + `pg_trgm` (+ Typesense) latency and recall measured | next |
 | 4 | **Prefix, typo, fragment matching** | `msku12*`, `msku1243565~1`, and fragment search each match a brute-force reference on 5M IDs | |
 | 5 | **Ranked top-k** | `ORDER BY col <=> 'q' LIMIT 20` through an ordered index scan that stops early; search-box p99 < 10 ms at 5M rows | |
 | 6 | **Identifier benchmark** | tin vs B-tree + `pg_trgm` vs Typesense: latency, recall@10, build time, size | |
@@ -42,21 +42,24 @@ Done: a pgrx 0.18 extension for PostgreSQL 18 (`crates/pg_tin`). See [DESIGN.md]
 - The planner picks the index. 40/40 sampled Super User queries return the same ctids as a sequential scan.
 - SQL regression test (`scripts/pg-test.sh`) and a PG18 CI job.
 
-## Phase 2: Writes
+## Phase 2: Writes ✅
 
-- **Pending list** (like GIN's fast update):
-  - `aminsert` appends `(tid, analyzed terms)` records to a WAL-logged page chain.
-  - Queries evaluate pending records directly.
-  - When the list passes `tin.pending_list_limit`, or at VACUUM / `tin_flush()`, it becomes a new immutable segment.
-- **Liveness bitmap per segment**, one bit per tuple, in the same tuple-space layout the query engine already uses:
-  - `ambulkdelete` clears the bits of dead tids, before the heap can reuse their line pointers.
-  - Queries AND each group's result with it.
-- **Overlapping segments**: flushed segments cover arbitrary blocks. Bitmap scans don't need ordered output, so each segment is evaluated separately.
-- **Cache with generations**: the metapage carries a generation counter plus the pending length. Backends reload only what changed: new segments, liveness after a VACUUM, the new tail of the pending list.
-- **Tests**:
-  - SQL regression covering insert / update / delete / vacuum / flush.
-  - pgbench with concurrent writers and readers.
-  - `kill -9` during writes, then index = seqscan after recovery.
+Design details are in [DESIGN.md](DESIGN.md#writes).
+
+- ✅ **Pending list** for inserts, flushed into immutable segments past `tin.pending_list_limit`, at VACUUM, or on `tin_flush()`.
+- ✅ **Liveness bitmap per segment**, cleared by `ambulkdelete` before line pointers can be reused.
+- ✅ **Tiered merges**, so the segment count stays logarithmic.
+- ✅ **Page chains + FSM reuse**, so the index size levels off under churn.
+- ✅ **Generation-based cache**: backends reload only what changed.
+
+**Tests**
+- **SQL regression**: insert / update / delete / rollback, flush, auto-flush, forced line-pointer reuse, REINDEX, TRUNCATE.
+- **Stress** (`crates/pg_tin/tests/stress`): about 195k pgbench transactions in 60 s from 8 clients, plus a VACUUM loop.
+  - 0 failures; index = seqscan on every check.
+  - Segment count 3–20; index size stable at 15 MB.
+- **Crash**: `kill -9` of the postmaster mid-write, while merges were running; index = seqscan after recovery, after VACUUM, and after more writes.
+
+**Still open (Phase 7)**: inserts are serialized per index, merges run inline, and segments over 64 MB only compact on REINDEX.
 
 ## Phase 4: Matching for identifiers
 
