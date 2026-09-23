@@ -26,8 +26,8 @@ Long-text ranking (BM25, phrases) and TIN-style big-corpus benchmarks still matt
 | 0 | Core engine (Rust): tokenizer, dictionary, two-level bitmaps, AND/OR/NOT, COUNT | Correct on real data + first speed numbers | ✅ done |
 | 1 | PostgreSQL 18 index access method (read-only) | `CREATE INDEX … USING tin`; `WHERE col ==> 'q'`; index = seqscan | ✅ done |
 | 2 | **Writes** | INSERT / UPDATE / DELETE / VACUUM correct under concurrency and after `kill -9`; index = seqscan | ✅ done |
-| 3 | **Identifier dataset + baselines** | 5M synthetic container / booking / B/L numbers; B-tree + `pg_trgm` (+ Typesense) latency and recall measured | next |
-| 4 | **Prefix, typo, fragment matching** | `msku12*`, `msku1243565~1`, and fragment search each match a brute-force reference on 5M IDs | |
+| 3 | **Identifier dataset + baselines** | 5M synthetic container / booking / B/L numbers; B-tree + `pg_trgm` (+ Typesense) latency and recall measured | ✅ done ([results](BENCHMARKS-IDS.md)) |
+| 4 | **Prefix, typo, fragment matching** | `msku12*`, `msku1243565~1`, and fragment search each match a brute-force reference on 5M IDs | next |
 | 5 | **Ranked top-k** | `ORDER BY col <=> 'q' LIMIT 20` through an ordered index scan that stops early; search-box p99 < 10 ms at 5M rows | |
 | 6 | **Identifier benchmark** | tin vs B-tree + `pg_trgm` vs Typesense: latency, recall@10, build time, size | |
 | 7 | Merges + zero-copy reads | Background merging of small segments; segments read straight from shared buffers, no per-backend copy | |
@@ -35,7 +35,7 @@ Long-text ranking (BM25, phrases) and TIN-style big-corpus benchmarks still matt
 
 ## Phase 1: Postgres index access method ✅
 
-Done: a pgrx 0.18 extension for PostgreSQL 18 (`crates/pg_tin`). See [DESIGN.md](DESIGN.md#postgres-integration-phase-1-cratespg_tin) and [BENCHMARKS.md](BENCHMARKS.md#inside-postgresql-18-phase-1).
+Done: a pgrx 0.18 extension for PostgreSQL 18 (`crates/pg_tin`). See [DESIGN.md](DESIGN.md#postgres-integration-cratespg_tin) and [BENCHMARKS.md](BENCHMARKS.md#inside-postgresql-18-phase-1).
 
 - `CREATE INDEX … USING tin`, the `==>` operator, the `text_tin_ops` opclass, and bitmap scans.
 - A memory-bounded streaming build: segments are cut at `maintenance_work_mem` and WAL-logged.
