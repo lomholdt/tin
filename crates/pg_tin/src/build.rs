@@ -1,4 +1,5 @@
-//! `ambuild`: stream the heap into memory-bounded segments.
+//! `ambuild`: stream the heap into memory-bounded segments (each followed by
+//! its liveness bitmap, initially "every indexed tuple").
 //!
 //! The heap is scanned serially (`allow_sync = false`, so it starts at block
 //! 0), which yields tuples in block order. Within a block, HOT chains can
@@ -12,7 +13,7 @@ use pgrx::prelude::*;
 use pgrx::PgMemoryContexts;
 use tin_core::{SegmentBuilder, Tid};
 
-use crate::storage::{self, SegmentRef, MAX_SEGMENTS};
+use crate::storage::{self, Meta, SegmentRef, MAX_SEGMENTS};
 
 struct BuildState {
     index: pg_sys::Relation,
@@ -48,8 +49,19 @@ impl BuildState {
                 "tin: index needs more than {MAX_SEGMENTS} segments; raise maintenance_work_mem and retry"
             );
         }
-        let bytes = builder.finish().to_bytes();
-        self.segments.push(storage::write_segment(self.index, &bytes));
+        let seg = builder.finish();
+        let bytes = seg.to_bytes();
+        let (first_block, n_blocks) = storage::write_blob(self.index, &bytes, false);
+        let (live_first, live_blocks) =
+            storage::write_blob(self.index, &storage::words_to_bytes(seg.docs()), false);
+        self.segments.push(SegmentRef {
+            id: self.segments.len() as u32,
+            first_block,
+            n_blocks,
+            len: bytes.len() as u64,
+            live_first,
+            live_blocks,
+        });
     }
 }
 
@@ -117,7 +129,10 @@ pub unsafe extern "C-unwind" fn ambuild(
     state.flush_page();
     state.finish_segment(0);
 
-    storage::write_metapage(index, &state.segments);
+    let mut meta = Meta::empty();
+    meta.next_segment_id = state.segments.len() as u32;
+    meta.segments = std::mem::take(&mut state.segments);
+    storage::write_meta_unlogged(index, &meta);
     storage::log_all_pages(index);
 
     let mut result = PgBox::<pg_sys::IndexBuildResult>::alloc0();

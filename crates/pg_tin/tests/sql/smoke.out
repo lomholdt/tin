@@ -122,27 +122,184 @@ SELECT 'x' ==> '"a phrase"';
 ERROR:  tin: invalid query "\"a phrase\"": phrase queries are not supported yet
 SELECT 'x' ==> '-only';
 ERROR:  tin: invalid query "-only": negation needs a positive term beside it
-INSERT INTO docs (body) VALUES ('new row');
-ERROR:  tin: index "docs_body_tin" is read-only in this version; load the data first, then CREATE INDEX (or REINDEX)
--- Deletes stay correct (Phase 1 keeps dead tids; visibility filters them).
-DELETE FROM docs WHERE id = 1;
-VACUUM docs;
-SET enable_seqscan = off;
-SELECT id FROM docs WHERE body ==> 'denim' ORDER BY id;
- id 
-----
-  2
+SELECT * FROM tin_stats('docs'::regclass);
+ERROR:  tin: "docs" is not a tin index
+-- A helper: does the index return exactly what a sequential scan returns?
+CREATE FUNCTION same_as_seqscan(q text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE via_index int[]; via_seq int[];
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = on;
+  SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO via_index FROM docs WHERE body ==> q;
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;
+  SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO via_seq FROM docs WHERE body ==> q;
+  RETURN via_index = via_seq;
+END $$;
+-- Writes land in the pending list and are searchable immediately.
+INSERT INTO docs (body) VALUES ('fresh denim overalls'), ('fresh linen shirt');
+SELECT pending_tuples FROM tin_stats('docs_body_tin'::regclass);
+ pending_tuples 
+----------------
+              2
 (1 row)
 
--- REINDEX builds a new generation; cached copies must not be reused.
-REINDEX INDEX docs_body_tin;
+SET enable_seqscan = off;
+SELECT id, body FROM docs WHERE body ==> 'fresh' ORDER BY id;
+  id   |         body         
+-------+----------------------
+ 20011 | fresh denim overalls
+ 20012 | fresh linen shirt
+(2 rows)
+
 SELECT id FROM docs WHERE body ==> 'denim' ORDER BY id;
+  id   
+-------
+     1
+     2
+ 20011
+(3 rows)
+
+-- Updating the indexed column: old version gone, new version found.
+UPDATE docs SET body = 'stretch denim shorts' WHERE id = 3;
+SELECT id, body FROM docs WHERE body ==> 'stretch' ORDER BY id;
+ id |         body         
+----+----------------------
+  1 | stretch denim jeans
+  3 | stretch denim shorts
+(2 rows)
+
+SELECT id FROM docs WHERE body ==> 'chinos';
  id 
 ----
-  2
+(0 rows)
+
+-- Rolled-back inserts never show up.
+BEGIN; INSERT INTO docs (body) VALUES ('ghost row'); ROLLBACK;
+SELECT count(*) FROM docs WHERE body ==> 'ghost';
+ count 
+-------
+     0
 (1 row)
+
+RESET enable_seqscan;
+-- Flush the pending list into a new segment.
+SELECT tin_flush('docs_body_tin'::regclass) AS flushed;
+ flushed 
+---------
+       4
+(1 row)
+
+SELECT segments > 1 AS has_segments, pending_tuples FROM tin_stats('docs_body_tin'::regclass);
+ has_segments | pending_tuples 
+--------------+----------------
+ t            |              0
+(1 row)
+
+SELECT same_as_seqscan(q) FROM unnest(ARRAY['fresh', 'denim', 'stretch -shorts', 'seven eleven']) q;
+ same_as_seqscan 
+-----------------
+ t
+ t
+ t
+ t
+(4 rows)
+
+-- Deletes + VACUUM clear liveness bits, then the freed line pointers get
+-- reused by new rows: old queries must not see the newcomers.
+CREATE TEMP TABLE seven_slots AS SELECT ctid AS slot FROM docs WHERE body ==> 'seven';
+DELETE FROM docs WHERE body ==> 'seven';
+VACUUM docs;
+SELECT live_tuples < 20012 AS some_dead FROM tin_stats('docs_body_tin'::regclass);
+ some_dead 
+-----------
+ t
+(1 row)
+
+INSERT INTO docs (body) SELECT 'reborn ' || i FROM generate_series(1, 3000) i;
+SELECT count(*) > 100 AS reused_slots FROM docs WHERE body ==> 'reborn' AND ctid IN (SELECT slot FROM seven_slots);
+ reused_slots 
+--------------
+ t
+(1 row)
+
+SELECT count(*) AS seven_left FROM docs WHERE body ==> 'seven';
+ seven_left 
+------------
+          0
+(1 row)
+
+SELECT count(*) AS reborn FROM docs WHERE body ==> 'reborn';
+ reborn 
+--------
+   3000
+(1 row)
+
+SELECT same_as_seqscan(q) FROM unnest(ARRAY['seven', 'reborn', 'filler -eleven', 'eleven OR reborn']) q;
+ same_as_seqscan 
+-----------------
+ t
+ t
+ t
+ t
+(4 rows)
+
+-- Many inserts with a tiny pending limit: automatic flushes.
+SET tin.pending_list_limit = '64kB';
+INSERT INTO docs (body) SELECT 'bulk ' || i || ' batch' FROM generate_series(1, 5000) i;
+SELECT segments >= 4 AS auto_flushed, pending_bytes < 65536 + 1000 AS bounded FROM tin_stats('docs_body_tin'::regclass);
+ auto_flushed | bounded 
+--------------+---------
+ t            | t
+(1 row)
+
+SELECT count(*) FROM docs WHERE body ==> 'bulk batch';
+ count 
+-------
+  5000
+(1 row)
+
+SELECT same_as_seqscan(q) FROM unnest(ARRAY['bulk', 'bulk -batch', 'reborn OR bulk', 'fresh']) q;
+ same_as_seqscan 
+-----------------
+ t
+ t
+ t
+ t
+(4 rows)
+
+DELETE FROM docs WHERE body ==> 'bulk' AND id % 2 = 0;
+VACUUM docs;
+SELECT count(*) FROM docs WHERE body ==> 'bulk';
+ count 
+-------
+  2500
+(1 row)
+
+SELECT same_as_seqscan('bulk');
+ same_as_seqscan 
+-----------------
+ t
+(1 row)
+
+RESET tin.pending_list_limit;
+-- REINDEX compacts everything into fresh segments; cached copies must not be reused.
+REINDEX INDEX docs_body_tin;
+SELECT pending_tuples FROM tin_stats('docs_body_tin'::regclass);
+ pending_tuples 
+----------------
+              0
+(1 row)
+
+SELECT same_as_seqscan(q) FROM unnest(ARRAY['bulk', 'reborn', 'fresh', 'denim']) q;
+ same_as_seqscan 
+-----------------
+ t
+ t
+ t
+ t
+(4 rows)
 
 TRUNCATE docs;
+SET enable_seqscan = off;
 SELECT count(*) FROM docs WHERE body ==> 'denim';
  count 
 -------

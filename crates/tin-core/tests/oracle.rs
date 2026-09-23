@@ -276,3 +276,70 @@ fn open_ended_segments_and_single_doc_matcher_agree() {
         assert_eq!(scanned, want, "matches_text {plan:?}");
     }
 }
+
+#[test]
+fn liveness_bitmaps_hide_deleted_tuples() {
+    let c = corpus(21);
+    let mut b = SegmentBuilder::new(0, u32::MAX);
+    for (tid, text) in &c.docs {
+        b.add(*tid, text);
+    }
+    let seg = b.finish();
+
+    // Every doc maps to a distinct set bit, and back.
+    let mut from_bits = Vec::new();
+    seg.for_each_set_tid(seg.docs(), |bit, tid| {
+        assert_eq!(seg.tid_bit(tid), Some(bit));
+        from_bits.push(tid);
+    });
+    let all: Vec<Tid> = c.docs.iter().map(|(t, _)| *t).collect();
+    assert_eq!(from_bits, all);
+    assert!(seg.tid_bit(Tid::new(4_999_999, 1)).is_none());
+
+    // Delete a random third of the docs via the liveness bitmap.
+    let mut rng = Rng(8);
+    let mut live = seg.docs().to_vec();
+    let mut dead = BTreeSet::new();
+    for (tid, _) in &c.docs {
+        if rng.chance(0.33) {
+            let bit = seg.tid_bit(*tid).unwrap() as usize;
+            live[bit >> 6] &= !(1 << (bit & 63));
+            dead.insert(*tid);
+        }
+    }
+    for _ in 0..200 {
+        let plan = random_plan(&mut rng, 3);
+        let want: Vec<Tid> = eval(&plan, &c.truth).into_iter().filter(|t| !dead.contains(t)).collect();
+        let mut got = Vec::new();
+        seg.collect_live(&plan, Some(&live), &mut got);
+        assert_eq!(got, want, "{plan:?}");
+        assert_eq!(seg.count_live(&plan, Some(&live)), want.len() as u64);
+        let mut streamed = Vec::new();
+        seg.search_live(&plan, Some(&live), |t| streamed.push(t));
+        assert_eq!(streamed, want);
+    }
+}
+
+#[test]
+fn add_terms_and_overlapping_segments() {
+    let c = corpus(33);
+    let mut a = Analyzer::new();
+    // Deal docs round-robin into three segments whose block ranges overlap,
+    // feeding pre-analyzed terms (as a pending-list flush does).
+    let mut builders: Vec<SegmentBuilder> = (0..3).map(|_| SegmentBuilder::open_ended(0)).collect();
+    for (i, (tid, text)) in c.docs.iter().enumerate() {
+        let terms = a.unique_terms(text);
+        builders[i % 3].add_terms(*tid, terms.iter().map(|s| s.as_str()));
+    }
+    let idx = Index::from_segments(builders.into_iter().map(|b| b.finish()).collect());
+
+    let mut rng = Rng(34);
+    for _ in 0..200 {
+        let plan = random_plan(&mut rng, 3);
+        let want: Vec<Tid> = eval(&plan, &c.truth).into_iter().collect();
+        let mut got = idx.search_vec(&plan);
+        got.sort();
+        assert_eq!(got, want, "{plan:?}");
+        assert_eq!(idx.count(&plan), want.len() as u64);
+    }
+}

@@ -6,19 +6,35 @@
 //! SELECT count(*) FROM posts WHERE body ==> 'grub (uefi OR bios) -windows';
 //! ```
 //!
-//! Phase 1 scope: build + bitmap scans. The index is read-only after
-//! `CREATE INDEX`; inserts and non-HOT updates into an indexed table error
-//! until Phase 2 (mutable segments + liveness bitmaps).
+//! Writes go to a pending list that is flushed into immutable segments;
+//! VACUUM clears deleted tuples from per-segment liveness bitmaps.
 
 use pgrx::prelude::*;
-use pgrx::PgRelation;
+use pgrx::{GucContext, GucFlags, GucRegistry, PgRelation};
 use tin_core::Analyzer;
 
 mod build;
+mod pending;
 mod scan;
 mod storage;
+mod write;
 
 ::pgrx::pg_module_magic!();
+
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    GucRegistry::define_int_guc(
+        c"tin.pending_list_limit",
+        c"Size of a tin index's pending list before it is flushed into a new segment.",
+        c"Inserted tuples collect in a pending list that queries scan directly; past this size \
+          the list is turned into an immutable segment. Also flushed by VACUUM and tin_flush().",
+        &write::PENDING_LIST_LIMIT,
+        64,
+        i32::MAX / 1024,
+        GucContext::Userset,
+        GucFlags::UNIT_KB,
+    );
+}
 
 /// `doc ==> query`: the non-index path (sequential scans, rechecks). Uses the
 /// same analyzer and query semantics as the index.
@@ -37,16 +53,9 @@ fn tin_match(doc: &str, query: &str) -> bool {
     })
 }
 
-/// Inspect a tin index: one row per segment.
-/// `SELECT * FROM tin_segments('posts_body_tin'::regclass);`
-#[pg_extern(strict)]
-fn tin_segments(
-    index: pg_sys::Oid,
-) -> TableIterator<
-    'static,
-    (name!(segment, i32), name!(first_block, i64), name!(blocks, i64), name!(bytes, i64)),
-> {
-    let rel = unsafe { PgRelation::with_lock(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
+/// Open `index` (an OID; pass `'name'::regclass`) and check it is a tin index.
+fn open_tin(index: pg_sys::Oid, lockmode: u32) -> PgRelation {
+    let rel = unsafe { PgRelation::with_lock(index, lockmode as pg_sys::LOCKMODE) };
     let is_tin = unsafe {
         let form = &*(*rel.as_ptr()).rd_rel;
         form.relkind == pg_sys::RELKIND_INDEX as std::ffi::c_char
@@ -55,13 +64,63 @@ fn tin_segments(
     if !is_tin {
         error!("tin: \"{}\" is not a tin index", rel.name());
     }
-    let table = unsafe { storage::read_segment_table(rel.as_ptr()) };
+    rel
+}
+
+/// One row per segment: `SELECT * FROM tin_segments('idx'::regclass)`.
+#[pg_extern(strict)]
+fn tin_segments(
+    index: pg_sys::Oid,
+) -> TableIterator<
+    'static,
+    (
+        name!(segment, i32),
+        name!(first_block, i64),
+        name!(blocks, i64),
+        name!(bytes, i64),
+        name!(live_tuples, i64),
+    ),
+> {
+    let rel = open_tin(index, pg_sys::AccessShareLock);
+    let (meta, live) = unsafe { scan::stats(rel.as_ptr()) };
     TableIterator::new(
-        table
+        meta.segments
             .into_iter()
-            .enumerate()
-            .map(|(i, r)| (i as i32, r.first_block as i64, r.n_blocks as i64, r.len as i64)),
+            .zip(live)
+            .map(|(r, l)| (r.id as i32, r.first_block as i64, r.n_blocks as i64, r.len as i64, l as i64)),
     )
+}
+
+/// Pending-list size and totals: `SELECT * FROM tin_stats('idx'::regclass)`.
+#[pg_extern(strict)]
+fn tin_stats(
+    index: pg_sys::Oid,
+) -> TableIterator<
+    'static,
+    (
+        name!(segments, i32),
+        name!(live_tuples, i64),
+        name!(pending_tuples, i64),
+        name!(pending_bytes, i64),
+        name!(generation, i64),
+    ),
+> {
+    let rel = open_tin(index, pg_sys::AccessShareLock);
+    let (meta, live) = unsafe { scan::stats(rel.as_ptr()) };
+    TableIterator::once((
+        meta.segments.len() as i32,
+        live.iter().sum::<u64>() as i64,
+        meta.pending_count as i64,
+        meta.pending_bytes as i64,
+        meta.generation as i64,
+    ))
+}
+
+/// Flush the pending list into a new segment now; returns tuples flushed.
+#[pg_extern(strict)]
+fn tin_flush(index: pg_sys::Oid) -> i64 {
+    let rel = open_tin(index, pg_sys::RowExclusiveLock);
+    unsafe { write::flush(rel.as_ptr()) as i64 }
 }
 
 /// The index access method handler.
@@ -82,9 +141,9 @@ fn tin_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutin
 
     am.ambuild = Some(build::ambuild);
     am.ambuildempty = Some(build::ambuildempty);
-    am.aminsert = Some(aminsert);
-    am.ambulkdelete = Some(ambulkdelete);
-    am.amvacuumcleanup = Some(amvacuumcleanup);
+    am.aminsert = Some(write::aminsert);
+    am.ambulkdelete = Some(write::ambulkdelete);
+    am.amvacuumcleanup = Some(write::amvacuumcleanup);
     am.amcostestimate = Some(amcostestimate);
     am.amoptions = Some(amoptions);
     am.amvalidate = Some(amvalidate);
@@ -113,52 +172,6 @@ CREATE OPERATOR CLASS text_tin_ops DEFAULT FOR TYPE text USING tin AS
     name = "tin_operator",
     requires = [tin_match, tin_handler]
 );
-
-#[pg_guard]
-#[allow(clippy::too_many_arguments)]
-unsafe extern "C-unwind" fn aminsert(
-    index: pg_sys::Relation,
-    _values: *mut pg_sys::Datum,
-    _isnull: *mut bool,
-    _heap_tid: pg_sys::ItemPointer,
-    _heap: pg_sys::Relation,
-    _check_unique: pg_sys::IndexUniqueCheck::Type,
-    _index_unchanged: bool,
-    _index_info: *mut pg_sys::IndexInfo,
-) -> bool {
-    error!(
-        "tin: index \"{}\" is read-only in this version; load the data first, then CREATE INDEX (or REINDEX)",
-        build::name_of(index)
-    );
-}
-
-/// Phase 1 keeps dead tids (see `scan.rs` for why that is safe); Phase 2
-/// clears them in per-segment liveness bitmaps.
-#[pg_guard]
-unsafe extern "C-unwind" fn ambulkdelete(
-    _info: *mut pg_sys::IndexVacuumInfo,
-    stats: *mut pg_sys::IndexBulkDeleteResult,
-    _callback: pg_sys::IndexBulkDeleteCallback,
-    _callback_state: *mut std::ffi::c_void,
-) -> *mut pg_sys::IndexBulkDeleteResult {
-    if stats.is_null() {
-        PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0().into_pg()
-    } else {
-        stats
-    }
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn amvacuumcleanup(
-    info: *mut pg_sys::IndexVacuumInfo,
-    stats: *mut pg_sys::IndexBulkDeleteResult,
-) -> *mut pg_sys::IndexBulkDeleteResult {
-    let stats =
-        if stats.is_null() { PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0().into_pg() } else { stats };
-    (*stats).num_pages =
-        pg_sys::RelationGetNumberOfBlocksInFork((*info).index, pg_sys::ForkNumber::MAIN_FORKNUM);
-    stats
-}
 
 #[pg_guard]
 #[allow(clippy::too_many_arguments)]

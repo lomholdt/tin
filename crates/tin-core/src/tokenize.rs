@@ -34,6 +34,14 @@ impl Analyzer {
         }
     }
 
+    /// The distinct terms of `text`, sorted.
+    pub fn unique_terms(&mut self, text: &str) -> Vec<String> {
+        let mut v = self.terms(text);
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     /// Convenience for tests and query parsing.
     pub fn terms(&mut self, text: &str) -> Vec<String> {
         let mut out = Vec::new();

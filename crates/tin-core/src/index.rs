@@ -1,11 +1,11 @@
-//! An index = an ordered list of segments over disjoint, ascending block
-//! ranges.
+//! An index = a list of segments.
 //!
 //! The initial build mirrors TIN's: split the heap into `n` block ranges and
-//! build one immutable segment per range in parallel. Because segments never
-//! overlap, query results are the concatenation of per-segment results, still
-//! in heap (tid) order. (Mutable segments with overlapping ranges arrive in
-//! Phase 2.)
+//! build one immutable segment per range in parallel. Such segments don't
+//! overlap, so query results are the concatenation of per-segment results,
+//! still in heap (tid) order. Segments built later from inserted tuples can
+//! overlap others; every tuple still lives in exactly one segment, so results
+//! stay correct, but are then ordered per segment rather than globally.
 
 use std::collections::BTreeMap;
 
@@ -25,12 +25,6 @@ pub type SizeStats<C> = BTreeMap<(C, Encoding), ClassStats>;
 
 impl Index {
     pub fn from_segments(segments: Vec<Segment>) -> Self {
-        for w in segments.windows(2) {
-            assert!(
-                w[0].meta().end_block <= w[1].meta().first_block,
-                "segments must cover disjoint ascending block ranges"
-            );
-        }
         Index { segments }
     }
 

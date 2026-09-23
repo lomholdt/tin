@@ -1,45 +1,118 @@
-//! Bitmap scans: `WHERE col ==> 'query'` → `amgetbitmap`.
+//! Bitmap scans (`WHERE col ==> 'query'` → `amgetbitmap`) and the
+//! per-backend index cache.
 //!
-//! The index is immutable in Phase 1, so each backend loads it once and keeps
-//! it, keyed by relation OID *and* relfilenumber: REINDEX, TRUNCATE and
-//! VACUUM FULL all assign a new relfilenumber, so a stale copy is never used.
+//! Each backend keeps a decoded copy of every index it has scanned, keyed by
+//! (OID, relfilenumber): REINDEX, TRUNCATE and VACUUM FULL assign a new
+//! relfilenumber, so older copies are never consulted. Within one relfile the
+//! metapage says what changed:
+//!
+//! * `generation` moved (flush or VACUUM): reload every segment's liveness
+//!   bitmap and the whole pending list; load segments not seen before.
+//!   Segments themselves never change, so cached ones are reused by id.
+//! * only `pending_bytes` grew (inserts): read just the new records.
 //!
 //! Tids are handed to the executor as exact (`recheck = false`). That is
-//! sound while the index is read-only: a stale entry can only point at a
-//! dead tuple (the heap's visibility check drops it) or at a reused line
-//! pointer, and in Phase 1 every insert into the table fails in `aminsert`
-//! and aborts, so a reused slot only ever holds an aborted tuple or a
-//! heap-only tuple, which a bitmap heap scan never starts a HOT chain from.
-//! Phase 2 adds liveness bitmaps before inserts are allowed.
+//! sound because VACUUM clears a dead tuple's liveness bit (or drops its
+//! pending record) in `ambulkdelete`, before the heap can reuse its line
+//! pointer. A scan whose cached liveness predates such a VACUUM still only
+//! returns tids of tuples that were dead when the scan's snapshot was taken,
+//! and any tuple later placed in a reused slot is invisible to that snapshot,
+//! so the heap's visibility check drops it.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use pgrx::prelude::*;
-use tin_core::{Analyzer, Index, Plan};
+use tin_core::{Analyzer, Plan, Segment};
 
-use crate::storage;
+use crate::pending::{self, Record};
+use crate::storage::{self, Meta, MetaLock, PendingPos, SegmentRef};
 
-thread_local! {
-    static CACHE: RefCell<HashMap<(pg_sys::Oid, pg_sys::RelFileNumber), Rc<Index>>> =
-        RefCell::new(HashMap::new());
+/// A decoded index, as of some metapage state.
+pub struct IndexState {
+    generation: u64,
+    pending_pos: PendingPos,
+    loaded: HashMap<u32, Rc<Segment>>,
+    /// In metapage order.
+    pub segments: Vec<(SegmentRef, Rc<Segment>, Vec<u64>)>,
+    pub pending: Vec<Record>,
 }
 
-/// This backend's copy of `index`, loading it on first use.
-pub unsafe fn cached_index(index: pg_sys::Relation) -> Rc<Index> {
+type CacheKey = (pg_sys::Oid, pg_sys::RelFileNumber);
+
+thread_local! {
+    static CACHE: RefCell<HashMap<CacheKey, Rc<RefCell<IndexState>>>> = RefCell::new(HashMap::new());
+}
+
+/// Load `seg`'s segment (not its liveness).
+pub unsafe fn load_segment(index: pg_sys::Relation, seg: &SegmentRef) -> Segment {
+    let bytes = storage::read_blob(index, seg.first_block, seg.n_blocks, seg.len);
+    Segment::from_bytes(&bytes)
+        .unwrap_or_else(|e| error!("tin: segment {} at block {} is corrupt: {e}", seg.id, seg.first_block))
+}
+
+/// Liveness words of a segment with `tuple_bits` positions.
+pub fn live_words(seg: &Segment) -> usize {
+    (seg.tuple_bits() as usize).div_ceil(64)
+}
+
+/// This backend's up-to-date copy of `index`.
+pub unsafe fn state(index: pg_sys::Relation) -> Rc<RefCell<IndexState>> {
     let key = ((*index).rd_id, (*index).rd_locator.relNumber);
-    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return hit;
-    }
-    let loaded = Rc::new(storage::read_index(index));
-    CACHE.with(|c| {
+    let st = CACHE.with(|c| {
         let mut c = c.borrow_mut();
-        // Drop older generations of the same index.
-        c.retain(|k, _| k.0 != key.0);
-        c.insert(key, loaded.clone());
+        if !c.contains_key(&key) {
+            // Drop older generations of the same index.
+            c.retain(|k, _| k.0 != key.0);
+            c.insert(
+                key,
+                Rc::new(RefCell::new(IndexState {
+                    generation: u64::MAX,
+                    pending_pos: PendingPos::default(),
+                    loaded: HashMap::new(),
+                    segments: Vec::new(),
+                    pending: Vec::new(),
+                })),
+            );
+        }
+        c[&key].clone()
     });
-    loaded
+    refresh(index, &mut st.borrow_mut());
+    st
+}
+
+unsafe fn refresh(index: pg_sys::Relation, st: &mut IndexState) {
+    let lock = MetaLock::share(index);
+    let meta = lock.read();
+    if meta.generation == st.generation {
+        if meta.pending_bytes != st.pending_pos.total {
+            let (bytes, pos) = storage::read_pending(index, &meta, st.pending_pos);
+            st.pending.extend(pending::decode_all(&bytes));
+            st.pending_pos = pos;
+        }
+        return;
+    }
+    // Segments are immutable: reuse the ones we have, load the rest. (Loaded
+    // under the shared metapage lock for simplicity; that briefly holds up
+    // inserters the first time a backend reads a large index.)
+    let mut segments = Vec::with_capacity(meta.segments.len());
+    for r in &meta.segments {
+        let seg = match st.loaded.get(&r.id) {
+            Some(s) => s.clone(),
+            None => Rc::new(load_segment(index, r)),
+        };
+        let live = storage::read_liveness(index, r, live_words(&seg));
+        segments.push((*r, seg, live));
+    }
+    let (bytes, pos) = storage::read_pending(index, &meta, PendingPos::start(&meta));
+    drop(lock);
+
+    st.loaded = segments.iter().map(|(r, s, _)| (r.id, s.clone())).collect();
+    st.segments = segments;
+    st.pending = pending::decode_all(&bytes);
+    st.pending_pos = pos;
+    st.generation = meta.generation;
 }
 
 pub fn parse_query(q: &str) -> Plan {
@@ -88,7 +161,8 @@ pub unsafe extern "C-unwind" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *m
         _ => Plan::And(plans),
     };
 
-    let index = cached_index((*scan).indexRelation);
+    let st = state((*scan).indexRelation);
+    let st = st.borrow();
     const BATCH: usize = 4096;
     let mut batch: Vec<pg_sys::ItemPointerData> = Vec::with_capacity(BATCH);
     let mut n = 0i64;
@@ -98,7 +172,7 @@ pub unsafe extern "C-unwind" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *m
             batch.clear();
         }
     };
-    index.search(&plan, |t| {
+    let mut emit = |t: tin_core::Tid| {
         let mut ip = pg_sys::ItemPointerData::default();
         pgrx::itemptr::item_pointer_set_all(&mut ip, t.block, t.offset);
         batch.push(ip);
@@ -106,7 +180,25 @@ pub unsafe extern "C-unwind" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *m
         if batch.len() == BATCH {
             flush(&mut batch);
         }
-    });
+    };
+    for (_, seg, live) in &st.segments {
+        seg.search_live(&plan, Some(live), &mut emit);
+    }
+    for rec in &st.pending {
+        if rec.matches(&plan) {
+            emit(rec.tid);
+        }
+    }
     flush(&mut batch);
     n
+}
+
+/// Totals for `tin_stats`.
+pub unsafe fn stats(index: pg_sys::Relation) -> (Meta, Vec<u64>) {
+    let st = state(index);
+    let st = st.borrow();
+    let live: Vec<u64> =
+        st.segments.iter().map(|(_, _, l)| l.iter().map(|w| w.count_ones() as u64).sum()).collect();
+    let meta = MetaLock::share(index).read();
+    (meta, live)
 }

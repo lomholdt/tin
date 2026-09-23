@@ -1,11 +1,15 @@
-//! Segments: self-contained inverted indexes over a contiguous range of heap
-//! blocks.
+//! Segments: self-contained inverted indexes over a range of heap blocks.
 //!
 //! A segment is a term dictionary (an FST mapping term -> dictionary value)
 //! plus a postings area. Because postings are keyed by tid, a segment that
 //! covers blocks `[first_block, end_block)` only ever contains tids in that
 //! range, so segments built in parallel over disjoint block ranges can be
 //! queried back-to-back and yield results in heap order.
+//!
+//! Every tuple a segment knows has a bit in its *tuple space*: blocks laid
+//! end to end, `width(block)` bits each (the page directory). The segment
+//! stores which of those bits are documents (`docs`); callers can pass a
+//! liveness bitmap of the same shape to hide tuples deleted since.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +23,7 @@ use crate::tid::Tid;
 use crate::tokenize::Analyzer;
 
 const MAGIC: &[u8; 4] = b"TIN\0";
-const FORMAT_VERSION: u32 = 0;
+const FORMAT_VERSION: u32 = 1;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
@@ -38,8 +42,12 @@ pub struct Segment {
     dict: Map<Vec<u8>>,
     /// Postings area, followed by `TAIL_PADDING` zero bytes.
     postings: Vec<u8>,
+    /// One bit per tuple-space position: set for every indexed tuple.
+    docs: Vec<u64>,
     /// Derived from `widths` at load.
     spaces: SpaceTable,
+    /// Derived: tuple-space bit of each block's first line pointer (+ total).
+    block_start: Vec<u64>,
 }
 
 /// Accumulates documents (in ascending tid order) and encodes a [`Segment`].
@@ -51,6 +59,7 @@ pub struct SegmentBuilder {
     terms: Vec<Box<str>>,
     postings: Vec<Vec<Tid>>,
     widths: Vec<u16>,
+    docs: Vec<Tid>,
     last_tid: Option<Tid>,
     doc_count: u64,
     open_ended: bool,
@@ -68,6 +77,7 @@ impl SegmentBuilder {
             terms: Vec::new(),
             postings: Vec::new(),
             widths: Vec::new(),
+            docs: Vec::new(),
             last_tid: None,
             doc_count: 0,
             open_ended: false,
@@ -97,6 +107,24 @@ impl SegmentBuilder {
     /// Index one tuple. Tids must be strictly ascending and inside the
     /// segment's block range.
     pub fn add(&mut self, tid: Tid, text: &str) {
+        self.begin_doc(tid);
+        let Self { analyzer, term_ids, terms, postings, approx_bytes, .. } = self;
+        analyzer.for_each_term(text, |term, _pos| {
+            Self::push_term(term_ids, terms, postings, approx_bytes, tid, term);
+        });
+    }
+
+    /// Index one tuple from already-analyzed terms (e.g. a pending-list
+    /// record). Same ordering rules as [`add`](Self::add).
+    pub fn add_terms<'t>(&mut self, tid: Tid, doc_terms: impl IntoIterator<Item = &'t str>) {
+        self.begin_doc(tid);
+        let Self { term_ids, terms, postings, approx_bytes, .. } = self;
+        for term in doc_terms {
+            Self::push_term(term_ids, terms, postings, approx_bytes, tid, term);
+        }
+    }
+
+    fn begin_doc(&mut self, tid: Tid) {
         assert!(
             (self.first_block..self.end_block).contains(&tid.block),
             "{tid:?} outside segment blocks {}..{}",
@@ -111,29 +139,37 @@ impl SegmentBuilder {
             self.widths.resize(page + 1, 0);
         }
         self.widths[page] = self.widths[page].max(tid.offset);
+        self.docs.push(tid);
+        self.approx_bytes += 8;
+    }
 
-        let Self { analyzer, term_ids, terms, postings, approx_bytes, .. } = self;
-        analyzer.for_each_term(text, |term, _pos| {
-            let id = match term_ids.get(term) {
-                Some(&id) => id,
-                None => {
-                    let id = terms.len() as u32;
-                    let boxed: Box<str> = term.into();
-                    term_ids.insert(boxed.clone(), id);
-                    terms.push(boxed);
-                    postings.push(Vec::new());
-                    // Two copies of the term + map entry + Vec header.
-                    *approx_bytes += term.len() * 2 + 72;
-                    id
-                }
-            };
-            let list = &mut postings[id as usize];
-            // Boolean postings: one entry per tuple however often the term repeats.
-            if list.last() != Some(&tid) {
-                list.push(tid);
-                *approx_bytes += 12;
+    fn push_term(
+        term_ids: &mut FxHashMap<Box<str>, u32>,
+        terms: &mut Vec<Box<str>>,
+        postings: &mut Vec<Vec<Tid>>,
+        approx_bytes: &mut usize,
+        tid: Tid,
+        term: &str,
+    ) {
+        let id = match term_ids.get(term) {
+            Some(&id) => id,
+            None => {
+                let id = terms.len() as u32;
+                let boxed: Box<str> = term.into();
+                term_ids.insert(boxed.clone(), id);
+                terms.push(boxed);
+                postings.push(Vec::new());
+                // Two copies of the term + map entry + Vec header.
+                *approx_bytes += term.len() * 2 + 72;
+                id
             }
-        });
+        };
+        let list = &mut postings[id as usize];
+        // Boolean postings: one entry per tuple however often the term repeats.
+        if list.last() != Some(&tid) {
+            list.push(tid);
+            *approx_bytes += 12;
+        }
     }
 
     pub fn finish(self) -> Segment {
@@ -169,9 +205,17 @@ impl SegmentBuilder {
         let dict = Map::new(dict.into_inner().expect("fst build")).expect("fst load");
         postings.resize(postings.len() + TAIL_PADDING, 0);
 
+        let block_start = block_starts(&self.widths);
+        let mut docs = vec![0u64; (*block_start.last().unwrap() as usize).div_ceil(64)];
+        for t in &self.docs {
+            let bit = block_start[(t.block - self.first_block) as usize] as usize + t.offset_bit() as usize;
+            docs[bit >> 6] |= 1 << (bit & 63);
+        }
         let spaces = SpaceTable::new(PageDir::new(self.first_block, &self.widths));
         let segment = Segment {
             spaces,
+            block_start,
+            docs,
             meta: SegmentMeta {
                 first_block: self.first_block,
                 end_block: self.end_block,
@@ -231,7 +275,7 @@ impl Segment {
     }
 
     pub fn size_bytes(&self) -> usize {
-        self.dict_bytes() + self.postings_bytes() + self.page_dir_bytes()
+        self.dict_bytes() + self.postings_bytes() + self.page_dir_bytes() + self.docs.len() * 8
     }
 
     pub fn term(&self, term: &str) -> Option<TermPostings<'_>> {
@@ -287,23 +331,81 @@ impl Segment {
     }
 
     pub fn search(&self, plan: &Plan, f: impl FnMut(Tid)) {
-        cursor::for_each_tid(self.cursor(plan).as_mut(), &self.spaces, f);
+        self.search_live(plan, None, f)
+    }
+
+    /// Like [`search`](Self::search), skipping tuples whose bit in `live`
+    /// (a bitmap shaped like [`docs`](Self::docs)) is clear.
+    pub fn search_live(&self, plan: &Plan, live: Option<&[u64]>, f: impl FnMut(Tid)) {
+        cursor::for_each_tid(self.cursor(plan).as_mut(), &self.spaces, live, f);
     }
 
     /// Append every match to `out`, in tid order.
     pub fn collect(&self, plan: &Plan, out: &mut Vec<Tid>) {
-        cursor::collect_tids(self.cursor(plan).as_mut(), &self.spaces, out);
+        self.collect_live(plan, None, out)
+    }
+
+    pub fn collect_live(&self, plan: &Plan, live: Option<&[u64]>, out: &mut Vec<Tid>) {
+        cursor::collect_tids(self.cursor(plan).as_mut(), &self.spaces, live, out);
     }
 
     pub fn count(&self, plan: &Plan) -> u64 {
-        cursor::count(self.cursor(plan).as_mut(), &self.spaces)
+        self.count_live(plan, None)
+    }
+
+    pub fn count_live(&self, plan: &Plan, live: Option<&[u64]>) -> u64 {
+        cursor::count(self.cursor(plan).as_mut(), &self.spaces, live)
+    }
+
+    // --- Tuple space -------------------------------------------------------
+
+    /// Bitmap of indexed tuples, one bit per tuple-space position. The
+    /// initial liveness bitmap.
+    pub fn docs(&self) -> &[u64] {
+        &self.docs
+    }
+
+    /// Number of tuple-space positions (bits in `docs`).
+    pub fn tuple_bits(&self) -> u64 {
+        *self.block_start.last().unwrap()
+    }
+
+    /// Tuple-space position of `tid`, if the segment's directory covers it.
+    pub fn tid_bit(&self, tid: Tid) -> Option<u64> {
+        let page = tid.block.checked_sub(self.meta.first_block)? as usize;
+        let width = *self.widths.get(page)?;
+        (tid.offset <= width).then(|| self.block_start[page] + tid.offset_bit() as u64)
+    }
+
+    /// Calls `f(bit, tid)` for every set bit of `bits` (shaped like `docs`).
+    pub fn for_each_set_tid(&self, bits: &[u64], mut f: impl FnMut(u64, Tid)) {
+        let mut page = 0usize;
+        for (i, &word) in bits.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = (i * 64) as u64 + w.trailing_zeros() as u64;
+                while page + 1 < self.block_start.len() && self.block_start[page + 1] <= bit {
+                    page += 1;
+                }
+                if page < self.widths.len() {
+                    let tid = Tid::new(
+                        self.meta.first_block + page as u32,
+                        (bit - self.block_start[page]) as u16 + 1,
+                    );
+                    f(bit, tid);
+                }
+                w &= w - 1;
+            }
+        }
     }
 
     // --- Serialization --------------------------------------------------------
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let fst = self.dict.as_fst().as_bytes();
-        let mut out = Vec::with_capacity(64 + self.widths.len() * 2 + fst.len() + self.postings.len());
+        let mut out = Vec::with_capacity(
+            80 + self.widths.len() * 2 + self.docs.len() * 8 + fst.len() + self.postings.len(),
+        );
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.meta.first_block.to_le_bytes());
@@ -313,6 +415,10 @@ impl Segment {
         }
         out.extend_from_slice(&(self.widths.len() as u64).to_le_bytes());
         for w in &self.widths {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.docs.len() as u64).to_le_bytes());
+        for w in &self.docs {
             out.extend_from_slice(&w.to_le_bytes());
         }
         out.extend_from_slice(&(fst.len() as u64).to_le_bytes());
@@ -344,6 +450,12 @@ impl Segment {
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
+        let n_docs = r.u64()? as usize;
+        let docs: Vec<u64> = r
+            .take(n_docs.checked_mul(8).ok_or("bad docs length")?)?
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         let fst_len = r.u64()? as usize;
         let dict = Map::new(r.take(fst_len)?.to_vec()).map_err(|e| e.to_string())?;
         let post_len = r.u64()? as usize;
@@ -355,9 +467,26 @@ impl Segment {
         if r.pos != b.len() {
             return Err("trailing bytes".into());
         }
+        let block_start = block_starts(&widths);
+        if docs.len() != (*block_start.last().unwrap() as usize).div_ceil(64) {
+            return Err("docs bitmap does not match the page directory".into());
+        }
         let spaces = SpaceTable::new(PageDir::new(meta.first_block, &widths));
-        Ok(Segment { meta, widths, dict, postings, spaces })
+        Ok(Segment { meta, widths, dict, postings, docs, spaces, block_start })
     }
+}
+
+/// Prefix sums of `widths`: tuple-space bit of each block's first line
+/// pointer, plus the total as the last element.
+fn block_starts(widths: &[u16]) -> Vec<u64> {
+    let mut v = Vec::with_capacity(widths.len() + 1);
+    let mut acc = 0u64;
+    v.push(0);
+    for &w in widths {
+        acc += w as u64;
+        v.push(acc);
+    }
+    v
 }
 
 struct Reader<'a> {
