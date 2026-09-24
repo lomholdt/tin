@@ -7,3 +7,4 @@
 
 # Benchmark outputs
 /bench/text/text_results_*.tsv
+/bench/text/parallel_*.tsv

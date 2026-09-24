@@ -188,6 +188,23 @@ The 1.24M Super User posts (842 MB of text) in PostgreSQL 18, tin vs Postgres fu
 
 The Postgres numbers are from the first run. The tin numbers are from a later run of the same queries on the same server, after both speed-ups.
 
+### Parallel query
+
+The table above is one core. `tin_match` and `tin_score` are parallel-safe, and planner support functions now tell Postgres what a recheck costs (see [DESIGN](DESIGN.md#planner-costs)). So Postgres uses parallel workers for tin queries that read many rows. The same 250 queries with `max_parallel_workers_per_gather = 3` on 4 cores (`bench/text/parallel.py`, plain statements, because PL/pgSQL `SELECT INTO` never runs in parallel):
+
+| Kind | `count` p50 / p90, 1 core | … 3 workers | top 10 p50 / p90, 1 core | … 3 workers |
+|---|---:|---:|---:|---:|
+| `a b c` (AND) | 10 / 85 ms | 6 / 48 ms | 32 / 392 ms | 32 / 161 ms |
+| `"a b c"` | 38 / 264 ms | 30 / 194 ms | 24 / 160 ms | 26 / 105 ms |
+| `"a b"` | 325 / 1,863 ms | 184 / 1,023 ms | 239 / 2,435 ms | 117 / 1,187 ms |
+| `a THEN/3 b` | 145 / 1,808 ms | 97 / 968 ms | 100 / 2,249 ms | 64 / 1,113 ms |
+| `a NEAR/5 b` | 344 / 1,975 ms | 199 / 1,729 ms | 457 / 3,742 ms | 199 / 1,989 ms |
+
+- **The slowest query** went from 5.8 s to 2.6 s. A full scan for `"and the"` went from 5.3 s to 1.8 s (a parallel sequential scan); top 10 by score went from 7.8 s to 2.4 s.
+- **Before the cost fix, Postgres never parallelized** these. It thought `==>` cost 10 operator calls a row whatever the text length, and parallel workers only split CPU cost. It even preferred a serial index scan (5.8 s) over a parallel sequential scan (1.7 s) for common words, because Postgres charges a plain index scan nothing for rechecking its own condition.
+- **Small queries don't change:** rare phrases stay single index scans (~20–30 ms), and identifier plans are unchanged.
+- The Postgres full-text numbers above are one core; with workers it gains too, so compare like with like.
+
 ### The word splitter
 
 Splitting text into words (Unicode UAX #29, via `unicode-segmentation`) ran at ~130 MB/s, about 5 µs of every 710-byte post. `tokenize::for_each_word` now gives exactly the same words 5× faster:

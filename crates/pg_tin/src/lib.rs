@@ -15,6 +15,7 @@ use tin_core::span::{DocWords, Wanted};
 use tin_core::Analyzer;
 
 mod build;
+mod cost;
 mod options;
 mod pending;
 mod scan;
@@ -67,9 +68,9 @@ pub extern "C-unwind" fn _PG_init() {
 /// `doc ==> query`: the non-index path (sequential scans, rechecks). Uses the
 /// same analyzer and query semantics as the index, plus word positions for
 /// phrases and proximity (which the index only narrows down). Analyzing each document
-/// costs roughly ten simple operators (0.4 µs a row on short identifiers),
-/// hence `cost = 10`.
-#[pg_extern(immutable, parallel_safe, strict, cost = 10)]
+/// costs more the longer the text: a planner support function (`cost.rs`)
+/// charges by the column's average width.
+#[pg_extern(immutable, parallel_safe, strict, cost = 10, support = cost::tin_match_support)]
 fn tin_match(doc: &str, query: &str) -> bool {
     thread_local! {
         static LAST: std::cell::RefCell<Option<(String, tin_core::Query, Wanted)>> =
@@ -126,7 +127,7 @@ fn tin_search_distance(doc: &str, query: &str) -> f64 {
 /// `ORDER BY tin_score('posts_body_tin', body, q) DESC`. Rows that don't
 /// match still get a score; filter with `==>`. Weights follow boosts
 /// (`beer^2`); terms under a negation don't count.
-#[pg_extern(stable, parallel_safe, strict, cost = 20)]
+#[pg_extern(stable, parallel_safe, strict, cost = 20, support = cost::tin_score_support)]
 fn tin_score(index: pg_sys::Oid, doc: &str, query: &str) -> f64 {
     score::score(index, doc, query)
 }
@@ -348,7 +349,10 @@ unsafe extern "C-unwind" fn amcostestimate(
     let mut costs = pg_sys::GenericCosts::default();
     pg_sys::genericcostestimate(root, path, loop_count, &mut costs);
     *startup = costs.indexStartupCost;
-    *total = costs.indexTotalCost;
+    // Rechecking candidates (phrases, proximity, fragments) is the index's
+    // cost to declare: Postgres charges plain index scans nothing for it.
+    let rows = costs.indexSelectivity * (*(*(*path).indexinfo).rel).tuples;
+    *total = costs.indexTotalCost + cost::recheck_cost(root, path, rows);
     *selectivity = costs.indexSelectivity;
     *correlation = costs.indexCorrelation;
     *pages = costs.numIndexPages;

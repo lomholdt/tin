@@ -94,4 +94,14 @@ assert_eq!(index.search_vec(&plan), vec![Tid::new(0, 1)]);
 
 The extension needs PostgreSQL 18 with server headers (`postgresql-server-dev-18`), `libclang`, and `cargo install cargo-pgrx --version 0.18.1 --locked && cargo pgrx init --pg18 $(which pg_config)`. Install it with `cd crates/pg_tin && cargo pgrx install --release`.
 
+### Upgrading
+
+Install the new build, then in each database:
+
+```sql
+ALTER EXTENSION pg_tin UPDATE;   -- e.g. 0.1.0 -> 0.2.0: keeps every index
+```
+
+Upgrade scripts live in `crates/pg_tin/sql/` and are idempotent: `0.1.0 → 0.2.0` also upgrades early development builds of 0.1.0. `scripts/pg-test.sh` checks that an upgraded database has exactly the catalog of a fresh install, and that its indexes keep working. The on-disk index format is versioned separately; an index in an older format says so and asks for a `REINDEX`.
+
 Builds use `-C target-cpu=native` (see `.cargo/config.toml`) so the bitmap loops compile to AVX2/AVX-512. To profile under valgrind, which can't run AVX-512, build with `RUSTFLAGS="-C target-cpu=x86-64-v3"` and set `TIN_PROFILE=conjunction` to run just that query kind.

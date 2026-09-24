@@ -250,6 +250,19 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
   - When unsure, it errs low. A flat guess (`contsel`, 0.1%) made `WHERE col ==> q LIMIT 10` a sequential scan: the planner expected a match every thousand rows, then read all 5M rows when q matched one.
   - `tin_match` is declared `COST 10`, since analyzing a row costs about ten simple operators.
 
+### Planner costs
+
+- `tin_match` (`==>`) and `tin_score` re-read the row, so their cost grows with its length. Planner **support functions** (`cost.rs`) charge `10 + average width` operator costs per call, with the width taken from the column's statistics. Scores count the width twice. The rule was measured: 0.4 µs a row for 36-byte identifiers, ~5 µs for 600-byte posts.
+- `amcostestimate` adds the recheck cost of a phrase, proximity or fragment query's candidates, because Postgres charges plain index scans nothing for rechecking their own condition.
+- With honest costs, Postgres parallelizes where it pays: phrases of common words run as parallel sequential scans, mid-size ones as parallel bitmap scans, and rare ones stay index scans. Identifier plans are unchanged.
+
+### Versions and upgrades
+
+- The extension version follows the crate version (`pg_tin.control`: `@CARGO_VERSION@`). Every release that changes SQL objects needs an upgrade script, `crates/pg_tin/sql/pg_tin--OLD--NEW.sql`:
+  - generate it with `scripts/upgrade-sql.py` from the new install script (`cargo pgrx schema`);
+  - add the old install script to `crates/pg_tin/tests/upgrade/` as the fixture `pg-test.sh` upgrades from.
+- The generated scripts are idempotent. Every function is `CREATE OR REPLACE`d; `TABLE` functions are dropped and recreated; missing operators and operator-class members are added. So a database built from any development snapshot of the old version converges to the new one. Removed objects must be dropped by hand.
+
 ### Known limits
 
 - Inserts into one index are serialized on the metapage lock (appends are short; flushes and merges run off it).

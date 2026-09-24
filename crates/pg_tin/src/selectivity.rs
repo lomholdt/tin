@@ -51,7 +51,7 @@ fn tin_restrict(fcinfo: pg_sys::FunctionCallInfo) -> f64 {
 }
 
 /// Whether `operator` is `~>` (else `==>`).
-unsafe fn is_search(operator: pg_sys::Oid) -> bool {
+pub unsafe fn is_search(operator: pg_sys::Oid) -> bool {
     let name = pg_sys::get_opname(operator);
     !name.is_null() && std::ffi::CStr::from_ptr(name).to_bytes() == b"~>"
 }
