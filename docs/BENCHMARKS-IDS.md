@@ -297,3 +297,25 @@ The whole day's load took under 3 minutes, about 500× the real rate. At the rea
   ```
 - **`fillfactor`** doesn't help here, for the same reason. It only pays off for updates that leave every indexed column alone, e.g. a status column outside the search text.
 - **Keep `search_text` narrow.** Only the identifiers people search for belong in the indexed text; other columns can then change with HOT updates and no tin work at all.
+
+## Phase 7, step 1: flushes and merges off the lock
+
+The same storm (700k updates, hot rows, one searching client), after these changes:
+
+- **Flushes are built without the metapage lock.** A snapshot of the pending list is built into a segment, and then installed under a brief exclusive lock. Records appended meanwhile stay pending. A heavyweight *flush mutex* (like GIN's pending-list cleanup) keeps one flush at a time, and inserters that find it taken just keep appending.
+- **Merge factor 8 → 4.** Every search walks every segment's dictionary: 16 segments took quiet search p50 from 1.2 to 4.8 ms.
+- **Compaction in VACUUM's cleanup**, i.e. in an autovacuum worker. When the small segments outweigh 25% of the largest, everything is merged into one segment and dead tuples are dropped. It takes its own lock, so flushes carry on meanwhile. It needs 2× the index in `maintenance_work_mem`.
+
+| | Phase 6 | Phase 7 |
+|---|---:|---:|
+| Updates/s | 4,170 | 3,948 |
+| Search p50 / p99 during the storm | 3.5 / 6.8 ms | 3.6 / 8.6 ms |
+| **Worst search during the storm** | **1,924 ms** | **93 ms** |
+| Searches over 100 ms | 31 | 0 |
+| After: tin vs B-tree probes (1,683) | 0 mismatches | 0 mismatches |
+
+**Trade-offs**
+
+- p99 is a little higher: flushes now use CPU alongside everything else, where before they froze everyone.
+- A compaction writes the new segment before the old pages are freed, at the next VACUUM. The file therefore holds about 2× the index (here 1.2 GB for ~0.4 GB of segments), and later flushes and compactions reuse that space.
+- When a compaction installs, every backend reloads the whole index on its next query: a 0.9–1.2 s search, once per backend. Zero-copy reads (next) remove that.

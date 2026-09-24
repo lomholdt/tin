@@ -176,9 +176,14 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
   - It holds the metapage lock exclusively, so inserts into one index are serialized.
   - The record's last chunk and the metapage update go into the same Generic WAL record.
 - **Flush**: past `tin.pending_list_limit` (default 1 MB; see [BENCHMARKS-IDS](BENCHMARKS-IDS.md#phase-6-update-storm)), at VACUUM, or on `tin_flush()`, the pending records become a new immutable segment (`SegmentBuilder::add_terms`).
-- **Merges**: segments are grouped by size into tiers (64 kB × 8ᵗ). When 8 segments share a tier they are merged into one (`Segment::merge` drops dead tuples), so the segment count stays logarithmic.
-  - Segments over 64 MB (for example from `CREATE INDEX`) are not merged inline; REINDEX compacts them.
+  - 🔧 **Off the lock**: the flushing backend snapshots the segment table and the pending list, then builds (and merges) without the metapage lock. It takes the lock only to install the result, keeping records appended meanwhile. Searches and inserts wait milliseconds, not the seconds a big merge takes.
+  - A **flush mutex** (a heavyweight lock on block 0, like GIN's pending-list cleanup) allows one flush at a time. An inserter that finds it taken keeps appending. VACUUM takes it for its pass 2 and cleanup, so neither can happen in the middle of a flush.
+- **Merges**: segments are grouped by size into tiers (64 kB × 8ᵗ). When 4 segments share a tier they are merged into one (`Segment::merge` drops dead tuples). Every search walks every segment, so few segments matter.
+  - Merges run as part of a flush (off the lock), except while a compaction runs.
   - Merged-away chains are *retired*, and only recycled by the next VACUUM's cleanup (see below).
+- **Compaction**, in VACUUM's cleanup (an autovacuum worker): when the smaller segments add up to more than 25% of the largest (e.g. the one `CREATE INDEX` built, which is too big to merge inline), everything is merged into one segment.
+  - It holds its own *compaction lock*. Flushes carry on meanwhile and just skip merging. The install keeps the segments flushed in the meantime.
+  - It runs only if 2× the index fits in `maintenance_work_mem`.
 - **VACUUM (`ambulkdelete`)** asks, for every live bit of every segment, whether that tid is dead, and clears the bits that are. It works in two passes:
   1. **Without the metapage lock**, so writers keep going: the segments that exist at the start.
   2. **With the metapage lock held exclusively**: segments flushed or merged in the meantime, plus the pending list, whose dead records are dropped by rewriting it.
@@ -203,7 +208,7 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 
 ### Known limits
 
-- Inserts into one index are serialized on the metapage lock, and a merge runs inline in whichever insert triggers it.
+- Inserts into one index are serialized on the metapage lock (appends are short; flushes and merges run off it).
 - The first query in a new backend copies the index into that backend's memory. Background merges and zero-copy reads from shared buffers are Phase 7.
 
 ## What is not built yet

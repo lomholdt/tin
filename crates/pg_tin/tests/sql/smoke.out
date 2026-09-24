@@ -267,18 +267,30 @@ SELECT same_as_seqscan(q) FROM unnest(ARRAY['bulk', 'bulk -batch', 'reborn OR bu
 (4 rows)
 
 DELETE FROM docs WHERE body ==> 'bulk' AND id % 2 = 0;
+-- VACUUM clears the deleted tuples, then compacts the many small segments
+-- into one (they outweigh the largest), dropping the dead tuples.
 VACUUM docs;
+SELECT segments AS after_vacuum, live_tuples FROM tin_stats('docs_body_tin'::regclass);
+ after_vacuum | live_tuples 
+--------------+-------------
+            1 |       22654
+(1 row)
+
 SELECT count(*) FROM docs WHERE body ==> 'bulk';
  count 
 -------
   2500
 (1 row)
 
-SELECT same_as_seqscan('bulk');
+SELECT same_as_seqscan(q) FROM unnest(ARRAY['bulk', 'bulk -batch', 'reborn OR bulk', 'fresh', 'seven -eleven']) q;
  same_as_seqscan 
 -----------------
  t
-(1 row)
+ t
+ t
+ t
+ t
+(5 rows)
 
 RESET tin.pending_list_limit;
 -- Identifier patterns on an index with grams: prefix, fragment, typo.

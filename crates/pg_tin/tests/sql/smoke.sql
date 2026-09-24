@@ -97,9 +97,12 @@ SELECT segments >= 4 AS auto_flushed, pending_bytes < 65536 + 1000 AS bounded FR
 SELECT count(*) FROM docs WHERE body ==> 'bulk batch';
 SELECT same_as_seqscan(q) FROM unnest(ARRAY['bulk', 'bulk -batch', 'reborn OR bulk', 'fresh']) q;
 DELETE FROM docs WHERE body ==> 'bulk' AND id % 2 = 0;
+-- VACUUM clears the deleted tuples, then compacts the many small segments
+-- into one (they outweigh the largest), dropping the dead tuples.
 VACUUM docs;
+SELECT segments AS after_vacuum, live_tuples FROM tin_stats('docs_body_tin'::regclass);
 SELECT count(*) FROM docs WHERE body ==> 'bulk';
-SELECT same_as_seqscan('bulk');
+SELECT same_as_seqscan(q) FROM unnest(ARRAY['bulk', 'bulk -batch', 'reborn OR bulk', 'fresh', 'seven -eleven']) q;
 RESET tin.pending_list_limit;
 
 -- Identifier patterns on an index with grams: prefix, fragment, typo.

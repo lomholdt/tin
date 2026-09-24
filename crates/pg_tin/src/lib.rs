@@ -170,7 +170,7 @@ fn tin_stats(
 #[pg_extern(strict)]
 fn tin_flush(index: pg_sys::Oid) -> i64 {
     let rel = open_tin(index, pg_sys::RowExclusiveLock);
-    unsafe { write::flush(rel.as_ptr()) as i64 }
+    unsafe { write::flush(rel.as_ptr(), true) as i64 }
 }
 
 /// The index access method handler.
