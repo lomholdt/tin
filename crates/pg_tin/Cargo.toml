@@ -17,6 +17,7 @@ pg_test = []
 [dependencies]
 pgrx = "=0.18.1"
 tin-core.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 pgrx-tests = "=0.18.1"

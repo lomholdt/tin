@@ -20,7 +20,7 @@ use rustc_hash::FxHashMap;
 use crate::bytes::Bytes;
 use crate::cursor::{self, And, AndNot, Bits, Cursor, Empty, Or, SpaceTable};
 use crate::pattern::{self, OsaDfa, GRAM_MARK, GRAM_MIN_FRAGMENT};
-use crate::postings::{Encoder, Encoding, PageDir, TermPostings, TAIL_PADDING};
+use crate::postings::{self, Encoder, Encoding, PageDir, TermPostings, TAIL_PADDING};
 use crate::query::Plan;
 use crate::tid::Tid;
 use crate::tokenize::Analyzer;
@@ -331,6 +331,37 @@ impl Segment {
     /// interleave across inputs but each tid must live in only one of them.
     /// Returns `None` if nothing is live.
     pub fn merge(inputs: &[(&Segment, Option<&[u64]>)]) -> Option<Segment> {
+        let m = Merge::new(inputs)?;
+        let part = m.part(None, None);
+        Some(m.finish(vec![part]))
+    }
+}
+
+/// A [`Segment::merge`] that can be split by term range: [`part`](Merge::part)s
+/// are independent (run them on as many threads as you like), and
+/// [`finish`](Merge::finish) joins them. The result is the same, byte for
+/// byte, however the terms are split.
+pub struct Merge<'a> {
+    inputs: &'a [(&'a Segment, Option<&'a [u64]>)],
+    /// Every live tid, sorted.
+    docs: Vec<Tid>,
+    first_block: u32,
+    widths: Vec<u16>,
+    grams: bool,
+}
+
+/// The merged terms of one key range, and their postings.
+pub struct MergedPart {
+    keys: Vec<u8>,
+    key_ends: Vec<usize>,
+    values: Vec<u64>,
+    postings: Vec<u8>,
+    posting_count: u64,
+}
+
+impl<'a> Merge<'a> {
+    /// `None` if nothing is live.
+    pub fn new(inputs: &'a [(&'a Segment, Option<&'a [u64]>)]) -> Option<Merge<'a>> {
         let mut docs = Vec::new();
         for (seg, live) in inputs {
             seg.for_each_set_tid(live.unwrap_or(seg.docs()), |_, t| docs.push(t));
@@ -344,19 +375,66 @@ impl Segment {
             let w = &mut widths[(t.block - first_block) as usize];
             *w = (*w).max(t.offset);
         }
-
         let grams = inputs.iter().any(|(s, _)| s.meta.grams);
-        let mut asm = Assembler::new(first_block, widths, grams);
+        Some(Merge { inputs, docs, first_block, widths, grams })
+    }
+
+    /// Up to `n - 1` ascending keys cutting the dictionary into `n` ranges
+    /// of similar work (terms and postings bytes of the largest input).
+    pub fn split_points(&self, n: usize) -> Vec<Vec<u8>> {
+        let Some((seg, _)) = self.inputs.iter().max_by_key(|(s, _)| s.size_bytes()) else {
+            return Vec::new();
+        };
+        // A term's work: its postings bytes plus a fixed cost per term.
+        const TERM_WORK: u64 = 16;
+        let total = seg.postings.len() as u64 + seg.meta.term_count * TERM_WORK;
+        let mut cuts = Vec::new();
+        let (mut terms, mut offset) = (0u64, 0u64);
+        let mut stream = seg.dict.stream();
+        while let Some((key, value)) = stream.next() {
+            if cuts.len() + 1 >= n {
+                break;
+            }
+            terms += 1;
+            if let Some(o) = postings::postings_offset(value) {
+                offset = o;
+            }
+            if (offset + terms * TERM_WORK) * n as u64 >= total * (cuts.len() as u64 + 1) {
+                cuts.push(key.to_vec());
+            }
+        }
+        cuts.dedup();
+        cuts
+    }
+
+    /// Merge the terms in `[from, to)` (`None`: unbounded).
+    pub fn part(&self, from: Option<&[u8]>, to: Option<&[u8]>) -> MergedPart {
+        let dir = PageDir::new(self.first_block, &self.widths);
+        let mut out = MergedPart {
+            keys: Vec::new(),
+            key_ends: Vec::new(),
+            values: Vec::new(),
+            postings: Vec::new(),
+            posting_count: 0,
+        };
         let mut op = fst::map::OpBuilder::new();
-        for (seg, _) in inputs {
-            op = op.add(&seg.dict);
+        for (seg, _) in self.inputs {
+            let mut range = seg.dict.range();
+            if let Some(f) = from {
+                range = range.ge(f);
+            }
+            if let Some(t) = to {
+                range = range.lt(t);
+            }
+            op = op.add(range);
         }
         let mut union = op.union();
+        let mut enc = Encoder::default();
         let mut tids = Vec::new();
         while let Some((term, values)) = union.next() {
             tids.clear();
             for v in values {
-                let (seg, live) = inputs[v.index];
+                let (seg, live) = self.inputs[v.index];
                 let mut c = TermPostings::from_value(v.value, &seg.postings).cursor();
                 cursor::for_each_tid(c.as_mut(), &seg.spaces, live, |t| tids.push(t));
             }
@@ -364,9 +442,56 @@ impl Segment {
                 continue; // every tuple with this term was deleted
             }
             tids.sort_unstable();
-            asm.push(term, &tids);
+            let e = enc.encode_term(&tids, dir, &mut out.postings);
+            out.keys.extend_from_slice(term);
+            out.key_ends.push(out.keys.len());
+            out.values.push(e.value);
+            out.posting_count += tids.len() as u64;
         }
-        Some(asm.finish(end_block, &docs))
+        out
+    }
+
+    /// The merged segment, from parts covering every term, in key order.
+    pub fn finish(self, parts: Vec<MergedPart>) -> Segment {
+        let mut w = self.writer();
+        for part in parts {
+            w.push(part);
+        }
+        w.finish(self)
+    }
+
+    /// Joins parts as they come (in key order), so writing the dictionary
+    /// overlaps merging later parts.
+    pub fn writer(&self) -> MergeWriter {
+        MergeWriter(Assembler::new(self.first_block, self.widths.clone(), self.grams))
+    }
+}
+
+/// See [`Merge::writer`].
+pub struct MergeWriter(Assembler);
+
+impl MergeWriter {
+    /// The next part, in key order.
+    pub fn push(&mut self, part: MergedPart) {
+        let asm = &mut self.0;
+        let base = asm.postings.len() as u64;
+        asm.postings.extend_from_slice(&part.postings);
+        drop(part.postings);
+        let mut start = 0;
+        for (&end, &value) in part.key_ends.iter().zip(&part.values) {
+            asm.dict
+                .insert(&part.keys[start..end], postings::relocate(value, base))
+                .expect("parts are disjoint and in key order");
+            start = end;
+        }
+        asm.term_count += part.values.len() as u64;
+        asm.posting_count += part.posting_count;
+    }
+
+    /// The merged segment, once every part is in.
+    pub fn finish(self, merge: Merge<'_>) -> Segment {
+        let end_block = merge.docs.last().expect("non-empty").block + 1;
+        self.0.finish(end_block, &merge.docs)
     }
 }
 

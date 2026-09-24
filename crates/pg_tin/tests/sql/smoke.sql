@@ -214,3 +214,27 @@ SELECT same_as_seqscan(q) FROM unnest(ARRAY['bulk', 'reborn', 'fresh', 'denim'])
 TRUNCATE docs;
 SET enable_seqscan = off;
 SELECT count(*) FROM docs WHERE body ==> 'denim';
+-- Parallel build: batches built on threads, merged into one segment, the
+-- same bytes as a serial build.
+RESET enable_seqscan;
+CREATE TABLE par (id int, txt text);
+INSERT INTO par SELECT i, 'msku' || lpad((i * 7919 % 1000000)::text, 7, '0') || ' bk' || (i % 5000) || ' bl' || md5(i::text)
+  FROM generate_series(1, 100000) i;
+SET maintenance_work_mem = '128MB';
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX par_tin ON par USING tin (txt) WITH (grams = true);
+CREATE TEMP TABLE serial_bytes AS SELECT sum(bytes) AS b FROM tin_segments('par_tin'::regclass);
+DROP INDEX par_tin;
+SET max_parallel_maintenance_workers = 3;
+CREATE INDEX par_tin ON par USING tin (txt) WITH (grams = true);
+SELECT count(*) AS segments, sum(bytes) = (SELECT b FROM serial_bytes) AS same_bytes
+  FROM tin_segments('par_tin'::regclass);
+RESET max_parallel_maintenance_workers;
+RESET maintenance_work_mem;
+SET enable_seqscan = off;
+SELECT q, (SELECT count(*) FROM par WHERE txt ==> q) AS n FROM unnest(ARRAY['bk42', 'msku00*', '*4242*', 'bk4242~']) q;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT (SELECT count(*) FROM par WHERE txt LIKE '%msku00%') AS msku00, (SELECT count(*) FROM par WHERE txt LIKE '%4242%') AS frag;
+RESET enable_indexscan;
+RESET enable_bitmapscan;

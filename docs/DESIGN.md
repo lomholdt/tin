@@ -167,7 +167,15 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 
 - A serial heap scan through `index_build_range_scan`, with `allow_sync = false` so tids arrive in block order.
 - Each page's tuples are sorted first, because HOT chains can report a root offset after higher ones.
-- A segment is closed at a page boundary once its builder passes `maintenance_work_mem`, so memory stays bounded.
+- **Serial** (`max_parallel_maintenance_workers = 0`): a segment is closed at a page boundary once its builder passes `maintenance_work_mem`, so memory stays bounded.
+- 🔧 **Parallel**: the backend only scans. It hands batches of whole blocks to Rust threads, each of which builds one segment per batch.
+  - The threads never call into Postgres and run with every signal blocked, so Postgres's handlers only run on the backend.
+  - While waiting, the backend checks for interrupts. The threads are joined however the build ends.
+  - Batches are sized so the builders fit in half of `maintenance_work_mem`. The size uses the builder bytes per text byte seen so far.
+  - Like Postgres's own parallel builds, each thread needs 32 MB of `maintenance_work_mem`.
+- Closed segments are held and merged into one at the end. A serial build holds up to half of `maintenance_work_mem` and writes segments out as they close past that. A parallel build holds up to a quarter; past that, it merges what it holds into one segment and writes it.
+  - 🔧 The merge is split by term range (`Merge::split_points` / `part`). Threads merge the ranges, while the backend joins finished ranges into the one FST in key order (`MergeWriter`).
+  - Moving postings between ranges only shifts their offsets, so the result is byte-identical to a serial build.
 - Pages are written unlogged, then WAL-logged in one pass with `log_newpage_range`, which is how GIN logs its build.
 
 ### Writes

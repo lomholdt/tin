@@ -101,6 +101,24 @@ impl<'a> PageDir<'a> {
     }
 }
 
+/// A dictionary value moved along with its postings, which now start
+/// `base` bytes later in the postings area.
+pub fn relocate(value: u64, base: u64) -> u64 {
+    if value >> TAG_SHIFT == TAG_SINGLETON {
+        value
+    } else {
+        let payload = (value & PAYLOAD_MASK) + base;
+        assert!(payload <= PAYLOAD_MASK, "postings area too large");
+        (value & !PAYLOAD_MASK) | payload
+    }
+}
+
+/// Where a value's postings start in the postings area, if it has any
+/// (terms are laid out in key order, so this grows with the key).
+pub fn postings_offset(value: u64) -> Option<u64> {
+    (value >> TAG_SHIFT != TAG_SINGLETON).then_some(value & PAYLOAD_MASK)
+}
+
 /// Reusable scratch space for [`Encoder::encode_term`].
 #[derive(Default)]
 pub struct Encoder {

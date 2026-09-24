@@ -36,6 +36,6 @@ mod varint;
 pub use index::Index;
 pub use query::{Plan, Query, QueryError, SortedTerms, TermSet};
 pub use search::SearchBox;
-pub use segment::{Segment, SegmentBuilder, TermFilter};
+pub use segment::{Merge, MergeWriter, MergedPart, Segment, SegmentBuilder, TermFilter};
 pub use tid::Tid;
 pub use tokenize::Analyzer;

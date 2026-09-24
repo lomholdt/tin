@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tin_core::postings::Encoding;
-use tin_core::{Analyzer, Index, Plan, Segment, SegmentBuilder, Tid};
+use tin_core::{Analyzer, Index, Merge, Plan, Segment, SegmentBuilder, Tid};
 
 /// SplitMix64 — deterministic, dependency-free.
 struct Rng(u64);
@@ -381,6 +381,18 @@ fn merge_keeps_only_live_tuples() {
         segs.iter().zip(&lives).map(|(s, l)| (s, Some(l.as_slice()))).collect();
     let merged = Segment::merge(&inputs).unwrap();
     assert_eq!(merged.meta().doc_count as usize, c.docs.len() - dead.len());
+
+    // Split by term range, the same bytes however it is cut.
+    let whole = merged.to_bytes();
+    for n in [2, 3, 7, 1000] {
+        let m = Merge::new(&inputs).unwrap();
+        let cuts = m.split_points(n);
+        assert!(!cuts.is_empty() && cuts.len() < n && cuts.windows(2).all(|w| w[0] < w[1]));
+        let bounds: Vec<Option<&[u8]>> =
+            std::iter::once(None).chain(cuts.iter().map(|c| Some(c.as_slice()))).chain([None]).collect();
+        let parts = bounds.windows(2).map(|w| m.part(w[0], w[1])).collect();
+        assert_eq!(m.finish(parts).to_bytes(), whole, "{n} parts");
+    }
 
     // Serialization still round-trips after a merge.
     let merged = Segment::from_bytes(&merged.to_bytes()).unwrap();

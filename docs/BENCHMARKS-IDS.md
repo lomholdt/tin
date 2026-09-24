@@ -338,3 +338,28 @@ First search on a new connection (5M rows, 9 segments, 474 MB):
 - **Right after a server restart**, the first ~30 s of a storm showed 0.3–7 s searches (the first checkpoint's full-page writes on a cold cache). They're gone on a warm server.
 - **Stress test** (8 clients, tiny pending list, VACUUM loop, so segments are created and freed every second): index == seqscan, no errors; shared vs private made no throughput difference.
 - **Setting:** `tin.shared_cache_size` (default 1 GB; 0 turns sharing off). The least recently used segments are dropped beyond it.
+
+## Phase 7, step 3: parallel CREATE INDEX
+
+Nearly all of a build is pure Rust: tokenizing, 4-grams, sorting, and encoding the FST and postings. So the build doesn't use Postgres's parallel-worker machinery. The backend runs the heap scan, and Rust threads do the building:
+
+- **Scan**: the backend reads the heap and cuts it into batches of whole blocks.
+- **Build**: threads build one segment per batch. They never call into Postgres and run with every signal blocked.
+- **Merge**: the final merge is split by term range. Threads merge the ranges, and the backend writes each finished range into the one dictionary as it arrives.
+- **Thread count**: `max_parallel_maintenance_workers`, capped at the CPU count and at 32 MB of `maintenance_work_mem` per thread, like Postgres's own parallel builds. With 0 threads, the build is serial.
+
+`REINDEX` of the 5M-row index (`grams = true`, `maintenance_work_mem = 2GB`, 4 cores). This host is about 2× slower than the one behind the Phase 6 numbers:
+
+| Threads | Build segments | Merge + write | Total |
+|---:|---:|---:|---:|
+| 0 (serial) | | | 204 s |
+| 2 | | | 87 s |
+| 3 | 35 s | 14 s | 51 s |
+| 4 | 27 s | 14 s | **43 s** |
+
+- **The same index either way.** A parallel build writes one 403 MB segment, byte for byte the serial build's. The SQL test checks this, and `cargo test` checks that a merge split at any term boundaries gives the same bytes as a whole merge.
+- **Faster per core too.** Serial building took ~175 s; with 3 threads it took 35 s. Smaller builders stay in cache better.
+- **Splitting the merge**: 29 s → 14 s. What's left is serial: writing the one dictionary, holding every identifier and gram (~5 s), then writing and WAL-logging 403 MB of pages (~4 s).
+- **Cancellation** (`pg_cancel_backend`) stops the build within about 1 s, both mid-scan and mid-merge, with no threads left behind.
+- **Correctness after the rebuild:** storm `verify.sql` found 0 mismatches in 1,789 probes and all 100 hot rows. The stress suite was identical to seqscan, with 0 failed transactions.
+- **Setting:** raise `max_parallel_maintenance_workers` (default 2) to the core count for the fastest builds.

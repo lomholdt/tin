@@ -99,11 +99,11 @@ At 5M rows: every query kind has p99 < 7 ms (budget 2) or < 2 ms (budget 1), wit
 
 **Found**: 0.05% of searches stall 0.3–1.9 s while an insert flushes or merges inline under the metapage lock. That leads Phase 7.
 
-## Phase 7: Flush/merge off the lock, zero-copy reads, parallel build
+## Phase 7: Flush/merge off the lock, zero-copy reads, parallel build ✅
 
 1. ✅ **Flush and merge output built outside the metapage lock**, and swapped in under it. A flush mutex serializes flushes; compaction runs in VACUUM's cleanup under its own lock. Worst search during the 700k storm: 1.9 s → 93 ms ([results](BENCHMARKS-IDS.md#phase-7-step-1-flushes-and-merges-off-the-lock)).
 2. ✅ **Segments in shared memory**: one copy for all backends, mapped and parsed in place. The first search on a new connection went from 1–5 s to ~20 ms, and the index is in memory once instead of once per connection ([results](BENCHMARKS-IDS.md#phase-7-step-2-segments-in-shared-memory)).
-3. **Parallel `CREATE INDEX`**: build segments on all cores, then merge (103 s → ~35 s at 5M rows).
+3. ✅ **Parallel `CREATE INDEX`**: the backend scans, Rust threads build a segment per batch of blocks, and the final merge is split by term range across the same threads. At 5M rows on 4 cores: 204 s → **43 s** (4.7×), byte-identical to a serial build ([results](BENCHMARKS-IDS.md#phase-7-step-3-parallel-create-index)).
 
 ## Performance backlog (from Phase 0 profiling)
 
