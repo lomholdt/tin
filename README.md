@@ -46,6 +46,7 @@ The details, including where we deviate from the posts and why, are in:
 
 - [docs/DESIGN.md](docs/DESIGN.md)
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/BENCHMARKS-IDS.md](docs/BENCHMARKS-IDS.md) (identifier search)
+- [docs/PRODUCTION.md](docs/PRODUCTION.md): running pg_tin in production (settings, monitoring, upgrades, limits)
 - [docs/ROADMAP.md](docs/ROADMAP.md): aimed at Typesense-style search over ~5M shipping identifiers. Phase 7 moved flushes and merges off the lock, put segments in shared memory, and made `CREATE INDEX` parallel (5M rows in 43 s on 4 cores); Phase 8 added the query language, scoring and highlighting.
 
 ## Layout

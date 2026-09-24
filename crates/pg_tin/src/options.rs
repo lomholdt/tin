@@ -1,9 +1,9 @@
 //! Index options: `CREATE INDEX … USING tin (col) WITH (grams = true)`.
 //!
-//! `grams` also indexes every term's character trigrams, so `*fragment*`
-//! queries become an AND over trigrams (plus a heap recheck) instead of a
-//! scan of the whole dictionary. Worth it for identifier search; for long
-//! text it roughly triples the index.
+//! `grams` also indexes every term's character 4-grams, so `*fragment*`
+//! queries become an AND over 4-grams (plus a heap recheck) instead of a
+//! scan of the whole dictionary. Worth it for identifier search (2.3× the
+//! index at 5M IDs); for long text it roughly triples the index.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -26,7 +26,7 @@ pub fn register() {
         pg_sys::add_bool_reloption(
             kind,
             c"grams".as_ptr(),
-            c"Also index character trigrams, for fast *fragment* search".as_ptr(),
+            c"Also index character 4-grams, for fast *fragment* search".as_ptr(),
             false,
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
         );
