@@ -17,6 +17,7 @@ mod build;
 mod options;
 mod pending;
 mod scan;
+mod score;
 mod selectivity;
 mod shared;
 mod storage;
@@ -116,8 +117,75 @@ fn tin_search_distance(doc: &str, query: &str) -> f64 {
     search_tier(doc, query).map_or(f64::INFINITY, |t| t as f64)
 }
 
+/// BM25 relevance of `doc` for `query`, with row counts and term
+/// frequencies from `index` (the tin index on `doc`'s column):
+/// `ORDER BY tin_score('posts_body_tin', body, q) DESC`. Rows that don't
+/// match still get a score; filter with `==>`. Weights follow boosts
+/// (`beer^2`); terms under a negation don't count.
+#[pg_extern(stable, parallel_safe, strict, cost = 20)]
+fn tin_score(index: pg_sys::Oid, doc: &str, query: &str) -> f64 {
+    score::score(index, doc, query)
+}
+
+/// How `tin_score` came about, as JSON: each matched term's weight, term
+/// frequency, document frequency, idf and part of the score.
+#[pg_extern(stable, parallel_safe, strict)]
+fn tin_score_inspect(index: pg_sys::Oid, doc: &str, query: &str) -> pgrx::JsonB {
+    let e = score::explain(index, doc, query);
+    let terms: Vec<serde_json::Value> = e
+        .terms
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "term": t.term, "weight": t.weight, "tf": t.tf, "df": t.df,
+                "idf": round(t.idf), "score": round(t.score),
+            })
+        })
+        .collect();
+    pgrx::JsonB(serde_json::json!({
+        "score": round(e.score),
+        "matches": score::matches(index, doc, query),
+        "doc_terms": e.doc_len,
+        "avg_doc_terms": round(e.avg_len),
+        "docs": e.docs,
+        "k1": tin_core::score::K1,
+        "b": tin_core::score::B,
+        "terms": terms,
+    }))
+}
+
+fn round(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+/// `doc` with the words that match `query` wrapped in `start` / `stop`.
+#[pg_extern(immutable, parallel_safe, strict)]
+fn tin_highlight(
+    doc: &str,
+    query: &str,
+    start: default!(&str, "'<b>'"),
+    stop: default!(&str, "'</b>'"),
+) -> String {
+    let mut a = Analyzer::new();
+    tin_core::highlight::highlight(doc, &scan::parse_tinql(query), &mut a, start, stop)
+}
+
+/// Up to `words` words of `doc` around its best match, highlighted, with
+/// `…` where text was cut.
+#[pg_extern(immutable, parallel_safe, strict)]
+fn tin_snippet(
+    doc: &str,
+    query: &str,
+    words: default!(i32, 30),
+    start: default!(&str, "'<b>'"),
+    stop: default!(&str, "'</b>'"),
+) -> String {
+    let mut a = Analyzer::new();
+    tin_core::highlight::snippet(doc, &scan::parse_tinql(query), &mut a, start, stop, words.max(0) as usize)
+}
+
 /// Open `index` (an OID; pass `'name'::regclass`) and check it is a tin index.
-fn open_tin(index: pg_sys::Oid, lockmode: u32) -> PgRelation {
+pub fn open_tin(index: pg_sys::Oid, lockmode: u32) -> PgRelation {
     let rel = unsafe { PgRelation::with_lock(index, lockmode as pg_sys::LOCKMODE) };
     let is_tin = unsafe {
         let form = &*(*rel.as_ptr()).rd_rel;

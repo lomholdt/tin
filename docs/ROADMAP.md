@@ -110,7 +110,7 @@ At 5M rows: every query kind has p99 < 7 ms (budget 2) or < 2 ms (budget 1), wit
 Ideas and syntax from TIN's query language (TINQL, as documented in `planetscale/lead`); no code taken (it is AGPL).
 
 1. ✅ **Positional queries**: phrases (`"a b c"`, `_` gaps, `[a b]` choices, `~N` slop), `THEN/N`, `NEAR/N`, `[alternatives]`, `AT LEAST n OF` / `n%` / `ALL OF`, `AND NOT`, boosts `^N`. The index has no positions, so it returns rows holding the terms and each candidate is rechecked with minimal-interval semantics (`span.rs`). Randomized tests check the recheck against a brute-force evaluator.
-2. **Scoring and highlighting**: `tin_score` (BM25 with index statistics), `tin_highlight`, `tin_score_inspect`.
+2. ✅ **Scoring and highlighting**: `tin_score(index, doc, q)` is BM25. Term frequencies come from the row's text; row count, document frequencies and average length come from the index, so no format change was needed. Boosts weight terms. `tin_score_inspect` explains a score as JSON. `tin_highlight` / `tin_snippet` mark the words that made a row match.
 3. **Long-text benchmark** on the 1.24M Super User posts: phrases and proximity vs Postgres full-text search.
 
 ## Performance backlog (from Phase 0 profiling)

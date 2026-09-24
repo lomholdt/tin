@@ -1034,6 +1034,7 @@ dependencies = [
  "libc",
  "pgrx",
  "pgrx-tests",
+ "serde_json",
  "tin-core",
 ]
 

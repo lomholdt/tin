@@ -26,10 +26,16 @@ impl Analyzer {
     /// Calls `f(term, position)` for every term in `text`. `position` counts
     /// words, including dropped over-long ones, so gaps stay honest.
     pub fn for_each_term(&mut self, text: &str, mut f: impl FnMut(&str, u32)) {
-        for (pos, word) in text.unicode_words().enumerate() {
+        self.for_each_token(text, |t, pos, _| f(t, pos));
+    }
+
+    /// Like [`for_each_term`](Self::for_each_term), also giving each term's
+    /// byte range in `text` (for highlighting).
+    pub fn for_each_token(&mut self, text: &str, mut f: impl FnMut(&str, u32, std::ops::Range<usize>)) {
+        for (pos, (at, word)) in text.unicode_word_indices().enumerate() {
             fold_into(word, &mut self.buf);
             if !self.buf.is_empty() && self.buf.len() <= MAX_TERM_BYTES {
-                f(&self.buf, pos as u32);
+                f(&self.buf, pos as u32, at..at + word.len());
             }
         }
     }

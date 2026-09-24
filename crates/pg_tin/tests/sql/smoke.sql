@@ -277,3 +277,16 @@ SELECT q, prose_ids(q) AS ids, prose_same(q) AS index_eq_seqscan FROM unnest(ARR
 EXPLAIN (COSTS OFF) SELECT id FROM prose WHERE body ==> '"big bad wolf"';
 SELECT 'x' ==> 'a THEN b';
 SELECT 'x' ==> 'AT LEAST 2 OF a';
+
+-- Scoring (BM25 with the index's statistics), highlighting, snippets.
+SELECT id, round(tin_score('prose_tin'::regclass, body, 'wolf OR beer')::numeric, 4) AS score
+  FROM prose WHERE body ==> 'wolf OR beer' ORDER BY 2 DESC, id;
+-- A boost scales a term's part; a negated term adds nothing.
+SELECT round((tin_score('prose_tin'::regclass, body, 'wolf^2') / tin_score('prose_tin'::regclass, body, 'wolf'))::numeric, 6) AS ratio,
+       tin_score('prose_tin'::regclass, body, 'wolf AND NOT beer') = tin_score('prose_tin'::regclass, body, 'wolf') AS negation_free
+  FROM prose WHERE id = 1;
+SELECT jsonb_pretty(tin_score_inspect('prose_tin'::regclass, body, '"big bad" wolf^2')) FROM prose WHERE id = 1;
+SELECT tin_highlight(body, '"big bad wolf" OR beer') FROM prose WHERE id IN (1, 3) ORDER BY id;
+SELECT tin_highlight('send an e-mail, then e mail', 'e-mail', '[', ']');
+SELECT tin_snippet(repeat('filler ', 50) || 'the big bad wolf' || repeat(' filler', 50), '"big bad wolf"', 8);
+SELECT tin_score('docs'::regclass, 'x', 'x');

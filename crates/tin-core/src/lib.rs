@@ -22,11 +22,13 @@
 pub mod bitmap;
 pub mod bytes;
 pub mod cursor;
+pub mod highlight;
 pub mod index;
 pub mod pattern;
 pub mod postings;
 pub mod query;
 pub mod rank;
+pub mod score;
 pub mod search;
 pub mod segment;
 pub mod span;

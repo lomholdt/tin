@@ -12,6 +12,7 @@
 //! liveness bitmap of the same shape to hide tuples deleted since.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
@@ -90,6 +91,8 @@ pub struct Segment {
     spaces: SpaceTable,
     /// Derived: tuple-space bit of each block's first line pointer (+ total).
     block_start: Vec<u64>,
+    /// Derived on first use: see [`Segment::word_postings`].
+    word_postings: OnceLock<u64>,
 }
 
 /// Accumulates documents (in ascending tid order) and encodes a [`Segment`].
@@ -325,6 +328,7 @@ impl Assembler {
             widths: self.widths,
             dict,
             postings,
+            word_postings: OnceLock::new(),
         }
     }
 }
@@ -540,6 +544,27 @@ impl Segment {
 
     pub fn page_dir_bytes(&self) -> usize {
         self.widths.len() * 2
+    }
+
+    /// Postings of words, not counting 4-grams: the sum over documents of
+    /// their distinct terms (the document length scoring uses). Walks the
+    /// grams once, on first use, when the segment has them.
+    pub fn word_postings(&self) -> u64 {
+        *self.word_postings.get_or_init(|| {
+            if !self.meta.grams {
+                return self.meta.posting_count;
+            }
+            let mut mark = [0u8; 4];
+            let lo = GRAM_MARK.encode_utf8(&mut mark).as_bytes().to_vec();
+            let mut hi = lo.clone();
+            *hi.last_mut().unwrap() += 1;
+            let mut grams = 0;
+            let mut s = self.dict.range().ge(&lo).lt(&hi).into_stream();
+            while let Some((_, v)) = s.next() {
+                grams += TermPostings::from_value(v, &self.postings).doc_count();
+            }
+            self.meta.posting_count - grams
+        })
     }
 
     pub fn size_bytes(&self) -> usize {
@@ -983,7 +1008,16 @@ impl Segment {
             return Err("docs bitmap does not match the page directory".into());
         }
         let spaces = SpaceTable::new(PageDir::new(meta.first_block, &widths));
-        Ok(Segment { meta, widths, dict, postings, docs, spaces, block_start })
+        Ok(Segment {
+            meta,
+            widths,
+            dict,
+            postings,
+            docs,
+            spaces,
+            block_start,
+            word_postings: OnceLock::new(),
+        })
     }
 }
 

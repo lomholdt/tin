@@ -130,6 +130,45 @@ impl DocWords {
         }
     }
 
+    /// Positions to highlight for `q`, sorted: every occurrence of a
+    /// positive term, except that terms of a phrase or proximity item count
+    /// only inside its matches.
+    pub fn marks(&self, q: &Query) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.mark(q, &mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn mark(&self, q: &Query, out: &mut Vec<u32>) {
+        match q {
+            Query::Term(_) | Query::Prefix(_) | Query::Fragment(_) | Query::Fuzzy(..) => {
+                out.extend(self.leaf_spans(q).into_iter().map(|(p, _)| p))
+            }
+            Query::Not(_) => {}
+            Query::Boost(q, _) => self.mark(q, out),
+            Query::And(cs) | Query::Or(cs) | Query::AtLeast { of: cs, .. } => {
+                cs.iter().for_each(|c| self.mark(c, out))
+            }
+            Query::Phrase { .. } | Query::Near { .. } => {
+                let spans = self.spans(q);
+                let mut inner = Vec::new();
+                match q {
+                    Query::Phrase { slots, .. } => {
+                        slots.iter().flat_map(|s| &s.alts).for_each(|a| self.mark(a, &mut inner))
+                    }
+                    Query::Near { left, right, .. } => {
+                        self.mark(left, &mut inner);
+                        self.mark(right, &mut inner);
+                    }
+                    _ => unreachable!(),
+                }
+                out.extend(inner.into_iter().filter(|&p| spans.iter().any(|&(s, e)| s <= p && p <= e)));
+            }
+        }
+    }
+
     fn leaf_spans(&self, leaf: &Query) -> Vec<Span> {
         let mut v: Vec<Span> = self.leaf_terms(leaf).flat_map(|(_, ps)| ps.iter().map(|&p| (p, p))).collect();
         v.sort_unstable();

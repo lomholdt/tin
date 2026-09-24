@@ -683,3 +683,89 @@ SELECT 'x' ==> 'a THEN b';
 ERROR:  tin: invalid query "a THEN b": THEN needs a distance: THEN/N
 SELECT 'x' ==> 'AT LEAST 2 OF a';
 ERROR:  tin: invalid query "AT LEAST 2 OF a": AT LEAST n OF needs a [list]
+-- Scoring (BM25 with the index's statistics), highlighting, snippets.
+SELECT id, round(tin_score('prose_tin'::regclass, body, 'wolf OR beer')::numeric, 4) AS score
+  FROM prose WHERE body ==> 'wolf OR beer' ORDER BY 2 DESC, id;
+ id | score  
+----+--------
+  3 | 6.4936
+  8 | 4.6597
+  1 | 4.5339
+  7 | 3.9855
+  4 | 3.6984
+  6 | 3.4817
+  9 | 3.4817
+  2 | 2.7791
+  5 | 2.7791
+(9 rows)
+
+-- A boost scales a term's part; a negated term adds nothing.
+SELECT round((tin_score('prose_tin'::regclass, body, 'wolf^2') / tin_score('prose_tin'::regclass, body, 'wolf'))::numeric, 6) AS ratio,
+       tin_score('prose_tin'::regclass, body, 'wolf AND NOT beer') = tin_score('prose_tin'::regclass, body, 'wolf') AS negation_free
+  FROM prose WHERE id = 1;
+  ratio   | negation_free 
+----------+---------------
+ 2.000000 | t
+(1 row)
+
+SELECT jsonb_pretty(tin_score_inspect('prose_tin'::regclass, body, '"big bad" wolf^2')) FROM prose WHERE id = 1;
+          jsonb_pretty          
+--------------------------------
+ {                             +
+     "b": 0.75,                +
+     "k1": 1.2,                +
+     "docs": 2009.0,           +
+     "score": 16.567984,       +
+     "terms": [                +
+         {                     +
+             "df": 7,          +
+             "tf": 2,          +
+             "idf": 5.590987,  +
+             "term": "wolf",   +
+             "score": 9.067775,+
+             "weight": 2.0     +
+         },                    +
+         {                     +
+             "df": 6,          +
+             "tf": 2,          +
+             "idf": 5.734088,  +
+             "term": "big",    +
+             "score": 4.649932,+
+             "weight": 1.0     +
+         },                    +
+         {                     +
+             "df": 6,          +
+             "tf": 1,          +
+             "idf": 5.734088,  +
+             "term": "bad",    +
+             "score": 2.850277,+
+             "weight": 1.0     +
+         }                     +
+     ],                        +
+     "matches": true,          +
+     "doc_terms": 7,           +
+     "avg_doc_terms": 2.015431 +
+ }
+(1 row)
+
+SELECT tin_highlight(body, '"big bad wolf" OR beer') FROM prose WHERE id IN (1, 3) ORDER BY id;
+                tin_highlight                
+---------------------------------------------
+ the <b>big bad wolf</b> ate a big grey wolf
+ craft pale <b>beer</b> and more <b>beer</b>
+(2 rows)
+
+SELECT tin_highlight('send an e-mail, then e mail', 'e-mail', '[', ']');
+          tin_highlight          
+---------------------------------
+ send an [e-mail], then [e mail]
+(1 row)
+
+SELECT tin_snippet(repeat('filler ', 50) || 'the big bad wolf' || repeat(' filler', 50), '"big bad wolf"', 8);
+                      tin_snippet                      
+-------------------------------------------------------
+ …filler the <b>big bad wolf</b> filler filler filler…
+(1 row)
+
+SELECT tin_score('docs'::regclass, 'x', 'x');
+ERROR:  tin: "docs" is not a tin index
