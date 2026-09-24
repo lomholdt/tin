@@ -363,3 +363,22 @@ Nearly all of a build is pure Rust: tokenizing, 4-grams, sorting, and encoding t
 - **Cancellation** (`pg_cancel_backend`) stops the build within about 1 s, both mid-scan and mid-merge, with no threads left behind.
 - **Correctness after the rebuild:** storm `verify.sql` found 0 mismatches in 1,789 probes and all 100 hot rows. The stress suite was identical to seqscan, with 0 failed transactions.
 - **Setting:** raise `max_parallel_maintenance_workers` (default 2) to the core count for the fastest builds.
+
+## Re-run after the Phase 8 speed-ups (extension 0.2.0)
+
+The same 5M rows with the faster word splitter and the new planner costs, on the same server as Phase 7:
+
+| | Before | Now |
+|---|---:|---:|
+| `REINDEX`, 4 threads, warm cache | 43 s | **30 s** (building segments: 27 → 18 s) |
+| Search box, `tin1`, p50 per kind | 0.63–1.27 ms | 0.77–1.39 ms |
+| Search box, `tin1`, p99 per kind | 1.29–2.00 ms | 1.18–3.80 ms |
+| Storm: updates/s | 4,170 (Phase 6) | 4,161 |
+| Storm: search p50 / p99 / max | 4.1 / 10.6 / 114 ms (Phase 7) | 2.96 / 11.0 / 325 ms |
+| Storm: wrong results | 0 | 0 (1,320 probes; 100 of 100 hot rows) |
+
+- **Identifiers are short (~36 bytes)**, so the word splitter matters less than for posts. The build still got 30% faster, since every row is split once.
+- **Search latency is unchanged within noise.** Search-box queries were already answered by the index with little re-reading. The one 325 ms search during the storm is a single outlier; outliers like it appeared before too, right after a server restart.
+- **Identifier plans are unchanged** by the new cost model (checked with `EXPLAIN`: prefix, fragment, exact and search-box queries all stay index scans).
+- **`exact_booking` hit@10 now reads 37.6%.** The data changed, not the search: the update storms since Phase 5 gave 624 of the 1,000 target rows new booking numbers. All 376 targets that kept theirs are found.
+- The index was upgraded in place from 0.1.0 (`ALTER EXTENSION pg_tin UPDATE`, 11 ms), then rebuilt for the timing.
