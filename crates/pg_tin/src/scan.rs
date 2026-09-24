@@ -60,11 +60,22 @@ thread_local! {
     static CACHE: RefCell<HashMap<CacheKey, Rc<RefCell<IndexState>>>> = RefCell::new(HashMap::new());
 }
 
-/// Load `seg`'s segment (not its liveness).
+/// Load `seg`'s segment (not its liveness): mapped from shared memory when
+/// possible (see `shared`).
 pub unsafe fn load_segment(index: pg_sys::Relation, seg: &SegmentRef) -> Segment {
+    crate::shared::segment(index, seg)
+}
+
+/// Decode `seg`'s segment into this backend's own memory.
+pub unsafe fn load_private(index: pg_sys::Relation, seg: &SegmentRef) -> Segment {
     let bytes = storage::read_blob(index, seg.first_block, seg.n_blocks, seg.len);
     Segment::from_bytes(&bytes)
         .unwrap_or_else(|e| error!("tin: segment {} at block {} is corrupt: {e}", seg.id, seg.first_block))
+}
+
+/// Drop every cached index (at backend exit, before shared memory goes).
+pub fn clear_cache() {
+    CACHE.with(|c| c.borrow_mut().clear());
 }
 
 /// Liveness words of a segment with `tuple_bits` positions.

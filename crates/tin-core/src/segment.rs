@@ -17,6 +17,7 @@ use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 use rustc_hash::FxHashMap;
 
+use crate::bytes::Bytes;
 use crate::cursor::{self, And, AndNot, Bits, Cursor, Empty, Or, SpaceTable};
 use crate::pattern::{self, OsaDfa, GRAM_MARK, GRAM_MIN_FRAGMENT};
 use crate::postings::{Encoder, Encoding, PageDir, TermPostings, TAIL_PADDING};
@@ -76,9 +77,9 @@ pub struct Segment {
     meta: SegmentMeta,
     /// Page directory: line-pointer count per block from `first_block`.
     widths: Vec<u16>,
-    dict: Map<Vec<u8>>,
+    dict: Map<Bytes>,
     /// Postings area, followed by `TAIL_PADDING` zero bytes.
-    postings: Vec<u8>,
+    postings: Bytes,
     /// One bit per tuple-space position: set for every indexed tuple.
     docs: Vec<u64>,
     /// Derived from `widths` at load.
@@ -294,9 +295,10 @@ impl Assembler {
 
     /// `docs`: every indexed tid (any order).
     fn finish(self, end_block: u32, docs: &[Tid]) -> Segment {
-        let dict = Map::new(self.dict.into_inner().expect("fst build")).expect("fst load");
+        let dict = Map::new(Bytes::from_vec(self.dict.into_inner().expect("fst build"))).expect("fst load");
         let mut postings = self.postings;
         postings.resize(postings.len() + TAIL_PADDING, 0);
+        let postings = Bytes::from_vec(postings);
         let block_start = block_starts(&self.widths);
         let mut doc_bits = vec![0u64; (*block_start.last().unwrap() as usize).div_ceil(64)];
         for t in docs {
@@ -790,7 +792,17 @@ impl Segment {
         out
     }
 
+    /// Parse a serialized segment (copying it).
     pub fn from_bytes(b: &[u8]) -> Result<Segment, String> {
+        Segment::from_shared(Bytes::from_vec(b.to_vec()))
+    }
+
+    /// Parse a serialized segment in place: the dictionary and postings (all
+    /// but a few percent of it) stay views into `buf`, which may be memory
+    /// shared by many processes. Only the page directory and docs bitmap
+    /// are copied.
+    pub fn from_shared(buf: Bytes) -> Result<Segment, String> {
+        let b: &[u8] = &buf;
         let mut r = Reader { b, pos: 0 };
         if r.take(4)? != MAGIC {
             return Err("bad magic".into());
@@ -820,9 +832,13 @@ impl Segment {
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
             .collect();
         let fst_len = r.u64()? as usize;
-        let dict = Map::new(r.take(fst_len)?.to_vec()).map_err(|e| e.to_string())?;
+        let fst_at = r.pos;
+        r.take(fst_len)?;
+        let dict = Map::new(buf.slice(fst_at..fst_at + fst_len)).map_err(|e| e.to_string())?;
         let post_len = r.u64()? as usize;
-        let postings = r.take(post_len)?.to_vec();
+        let post_at = r.pos;
+        r.take(post_len)?;
+        let postings = buf.slice(post_at..post_at + post_len);
         if postings.len() < TAIL_PADDING || postings[postings.len() - TAIL_PADDING..].iter().any(|&b| b != 0)
         {
             return Err("postings area missing tail padding".into());

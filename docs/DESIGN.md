@@ -192,6 +192,12 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 
 ### Reads
 
+- 🔧 **Segments in shared memory** (`shared.rs`): a registry in a named DSM segment (`GetNamedDSMSegment`, PG 17+) maps (relfile, segment head block) to a pinned DSM segment holding the serialized segment.
+  - The first backend to need a segment copies it in; the others map it. `Segment::from_shared` keeps the dictionary and postings as views into the mapping, copying only the page directory and docs bitmap.
+  - Flushes and compactions publish new segments directly, and VACUUM unpins the ones it frees.
+  - Least recently used entries are dropped past `tin.shared_cache_size`.
+  - A hit is checked against the index's first page, in case a dropped index's relfile number was reused.
+  - Mappings are detached before Postgres tears down DSM at backend exit.
 - **Per-backend cache**, keyed by `(index OID, relfilenumber)`. REINDEX, TRUNCATE and VACUUM FULL change the relfilenumber, so a stale copy is never used. Under a shared metapage lock:
   - if the generation changed, the backend reloads every liveness bitmap and the whole pending list, and loads any segments it hasn't seen (segments are immutable and reused by id);
   - otherwise it reads only the new tail of the pending list.
@@ -209,7 +215,7 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 ### Known limits
 
 - Inserts into one index are serialized on the metapage lock (appends are short; flushes and merges run off it).
-- The first query in a new backend copies the index into that backend's memory. Background merges and zero-copy reads from shared buffers are Phase 7.
+- The first backend after a server restart copies each segment into shared memory (~1 s at 5M rows); every other backend maps it (~20 ms).
 
 ## What is not built yet
 

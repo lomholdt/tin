@@ -319,3 +319,22 @@ The same storm (700k updates, hot rows, one searching client), after these chang
 - p99 is a little higher: flushes now use CPU alongside everything else, where before they froze everyone.
 - A compaction writes the new segment before the old pages are freed, at the next VACUUM. The file therefore holds about 2× the index (here 1.2 GB for ~0.4 GB of segments), and later flushes and compactions reuse that space.
 - When a compaction installs, every backend reloads the whole index on its next query: a 0.9–1.2 s search, once per backend. Zero-copy reads (next) remove that.
+
+## Phase 7, step 2: segments in shared memory
+
+Before this, every backend decoded its own copy of every segment on its first query. At 5M rows that was ~400–500 MB and 1–5 s *per connection*, so 50 pooled connections would have held 20+ GB of identical copies.
+
+Now the first backend to need a segment copies it into dynamic shared memory once, and every other backend maps it and parses it in place (`Segment::from_shared`). Only the page directory and docs bitmap (a few percent) are copied per backend. Flushes and compactions **publish** each new segment straight from memory, so no reader ever pays for the copy.
+
+First search on a new connection (5M rows, 9 segments, 474 MB):
+
+| | Before (private copies) | Now (shared) |
+|---|---:|---:|
+| First connection after a server restart | 5.5 s | 1.1 s (fills shared memory once) |
+| Every later connection | 5.5 s | **~20 ms** |
+| Memory | 474 MB × connections | 474 MB once |
+
+- **Storm (700k updates) on a warm server:** p50 / p99 4.1 / 10.6 ms, max 114 ms, 0 searches over 300 ms. 1,730 probes, 0 mismatches.
+- **Right after a server restart**, the first ~30 s of a storm showed 0.3–7 s searches (the first checkpoint's full-page writes on a cold cache). They're gone on a warm server.
+- **Stress test** (8 clients, tiny pending list, VACUUM loop, so segments are created and freed every second): index == seqscan, no errors; shared vs private made no throughput difference.
+- **Setting:** `tin.shared_cache_size` (default 1 GB; 0 turns sharing off). The least recently used segments are dropped beyond it.

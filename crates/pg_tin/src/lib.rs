@@ -18,6 +18,7 @@ mod options;
 mod pending;
 mod scan;
 mod selectivity;
+mod shared;
 mod storage;
 mod write;
 
@@ -36,6 +37,17 @@ pub extern "C-unwind" fn _PG_init() {
         i32::MAX / 1024,
         GucContext::Userset,
         GucFlags::UNIT_KB,
+    );
+    GucRegistry::define_int_guc(
+        c"tin.shared_cache_size",
+        c"Shared memory for tin segments, shared by all backends (0: each backend keeps its own copy).",
+        c"The first backend to read a segment copies it into dynamic shared memory; the others map \
+          it. Least recently used segments are dropped past this size.",
+        &shared::SHARED_CACHE_MB,
+        0,
+        i32::MAX / 2,
+        GucContext::Suset,
+        GucFlags::UNIT_MB,
     );
     GucRegistry::define_int_guc(
         c"tin.search_typos",
@@ -164,6 +176,12 @@ fn tin_stats(
         meta.pending_bytes as i64,
         meta.generation as i64,
     ))
+}
+
+/// Segments in shared memory: `SELECT * FROM tin_shared_stats()`.
+#[pg_extern]
+fn tin_shared_stats() -> TableIterator<'static, (name!(segments, i64), name!(bytes, i64))> {
+    TableIterator::once(unsafe { shared::stats() })
 }
 
 /// Flush the pending list into a new segment now; returns tuples flushed.

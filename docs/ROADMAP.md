@@ -30,7 +30,7 @@ Long-text ranking (BM25, phrases) and TIN-style big-corpus benchmarks still matt
 | 4 | **Prefix, typo, fragment matching** | `msku12*`, `msku1243565~`, and fragment search each match a brute-force reference on 5M IDs | ✅ done ([results](BENCHMARKS-IDS.md#phase-4-prefix-typo-and-fragment-matching)) |
 | 5 | **Ranked top-k** | `ORDER BY col <~> 'q' LIMIT 10` through an ordered index scan that stops early; search-box p99 < 10 ms at 5M rows | ✅ done ([results](BENCHMARKS-IDS.md#phase-5-ranked-search-box)) |
 | 6 | **Identifier benchmark** | tin vs B-tree + `pg_trgm` vs Typesense: latency, recall@10, build time, size; **update storm** (700k updates/day, incl. the same rows over and over) | ✅ done ([results](BENCHMARKS-IDS.md#phase-6-update-storm)) |
-| 7 | Flush/merge off the lock, zero-copy reads, parallel build | No search stalls during flushes/merges; no ~1 s index copy on a backend's first query; `CREATE INDEX` on all cores | in progress (1/3 done) |
+| 7 | Flush/merge off the lock, zero-copy reads, parallel build | No search stalls during flushes/merges; no ~1 s index copy on a backend's first query; `CREATE INDEX` on all cores | in progress (2/3 done) |
 | 8 | Long text | BM25 top-k, phrases, visibility-map `COUNT(*)`, big-corpus benchmark vs GIN / ParadeDB | |
 
 ## Phase 1: Postgres index access method ✅
@@ -102,7 +102,7 @@ At 5M rows: every query kind has p99 < 7 ms (budget 2) or < 2 ms (budget 1), wit
 ## Phase 7: Flush/merge off the lock, zero-copy reads, parallel build
 
 1. ✅ **Flush and merge output built outside the metapage lock**, and swapped in under it. A flush mutex serializes flushes; compaction runs in VACUUM's cleanup under its own lock. Worst search during the 700k storm: 1.9 s → 93 ms ([results](BENCHMARKS-IDS.md#phase-7-step-1-flushes-and-merges-off-the-lock)).
-2. **Zero-copy reads**: segments read in place from shared buffers, so there's no ~1 s per-backend copy on the first query, or after a compaction.
+2. ✅ **Segments in shared memory**: one copy for all backends, mapped and parsed in place. The first search on a new connection went from 1–5 s to ~20 ms, and the index is in memory once instead of once per connection ([results](BENCHMARKS-IDS.md#phase-7-step-2-segments-in-shared-memory)).
 3. **Parallel `CREATE INDEX`**: build segments on all cores, then merge (103 s → ~35 s at 5M rows).
 
 ## Performance backlog (from Phase 0 profiling)

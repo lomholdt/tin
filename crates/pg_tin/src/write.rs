@@ -110,7 +110,7 @@ pub unsafe fn flush(index: pg_sys::Relation, wait: bool) -> u64 {
 
     // Build, merge and write, unlocked, on a copy of the segment table.
     let mut next = snap.clone();
-    let mut written: Vec<(u32, u32)> = Vec::new();
+    let mut written = Written::default();
     if !next.can_add_segment() {
         // Only reachable with many large (unmergeable) segments plus pages
         // waiting for VACUUM: the pending list keeps growing (still correct,
@@ -150,14 +150,13 @@ unsafe fn install(
     snap: &Meta,
     next: Meta,
     pending_pos: Option<PendingPos>,
-    written: &[(u32, u32)],
+    written: &Written,
 ) -> bool {
     let lock = MetaLock::exclusive(index);
     let mut meta = lock.read();
     if meta.generation != snap.generation {
         drop(lock);
-        let pages: Vec<u32> = written.iter().flat_map(|&(h, n)| storage::chain_blocks(index, h, n)).collect();
-        storage::free_pages(index, &pages);
+        written.free(index);
         warning!("tin: index \"{}\" changed during a flush; retrying later", crate::build::name_of(index));
         return false;
     }
@@ -175,6 +174,7 @@ unsafe fn install(
     debug_assert!(meta.fits());
     lock.write(index, &meta);
     drop(lock);
+    written.publish(index, &meta);
     storage::free_pages(index, &old_pages);
     pg_sys::IndexFreeSpaceMapVacuum(index);
     true
@@ -221,7 +221,7 @@ unsafe fn compact_locked(index: pg_sys::Relation) {
         segs.iter().zip(&lives).map(|(s, l)| (s, Some(l.as_slice()))).collect();
     let merged = Segment::merge(&inputs);
     drop(segs);
-    let mut written = Vec::new();
+    let mut written = Written::default();
     let mut out = snap.clone();
     out.segments.clear();
     if let Some(seg) = merged {
@@ -252,8 +252,7 @@ unsafe fn compact_locked(index: pg_sys::Relation) {
         // remove segments); or too many retired chains to record until the
         // next VACUUM frees them. Give the pages back instead.
         drop(lock);
-        let pages: Vec<u32> = written.iter().flat_map(|&(h, n)| storage::chain_blocks(index, h, n)).collect();
-        storage::free_pages(index, &pages);
+        written.free(index);
         return;
     }
     meta.segments = next.segments;
@@ -262,6 +261,7 @@ unsafe fn compact_locked(index: pg_sys::Relation) {
     meta.generation += 1;
     lock.write(index, &meta);
     drop(lock);
+    written.publish(index, &meta);
     log!(
         "tin: compacted {} segments ({} MB) of index \"{}\" into one in {:.1} s",
         snap.segments.len(),
@@ -273,17 +273,12 @@ unsafe fn compact_locked(index: pg_sys::Relation) {
 
 /// Write `seg` (and its liveness) and add it to `meta`'s segment table;
 /// record the chains in `written`.
-unsafe fn add_segment(
-    index: pg_sys::Relation,
-    meta: &mut Meta,
-    seg: &Segment,
-    written: &mut Vec<(u32, u32)>,
-) {
+unsafe fn add_segment(index: pg_sys::Relation, meta: &mut Meta, seg: &Segment, written: &mut Written) {
     let bytes = seg.to_bytes();
     let (first_block, n_blocks) = storage::write_blob(index, &bytes, true);
     let (live_first, live_blocks) = storage::write_blob(index, &storage::words_to_bytes(seg.docs()), true);
-    written.push((first_block, n_blocks));
-    written.push((live_first, live_blocks));
+    written.chains.push((first_block, n_blocks));
+    written.chains.push((live_first, live_blocks));
     meta.segments.push(SegmentRef {
         id: meta.next_segment_id,
         first_block,
@@ -293,6 +288,33 @@ unsafe fn add_segment(
         live_blocks,
     });
     meta.next_segment_id += 1;
+    written.blobs.push((first_block, bytes));
+}
+
+/// What a flush, merge or compaction wrote: page chains (freed if it can't
+/// install) and segment blobs (published to shared memory once installed,
+/// so no reader has to copy them in).
+#[derive(Default)]
+struct Written {
+    chains: Vec<(u32, u32)>,
+    blobs: Vec<(u32, Vec<u8>)>,
+}
+
+impl Written {
+    unsafe fn free(&self, index: pg_sys::Relation) {
+        let pages: Vec<u32> =
+            self.chains.iter().flat_map(|&(h, n)| storage::chain_blocks(index, h, n)).collect();
+        storage::free_pages(index, &pages);
+    }
+
+    /// Publish the blobs of segments that made it into `meta`.
+    unsafe fn publish(&self, index: pg_sys::Relation, meta: &Meta) {
+        for (head, bytes) in &self.blobs {
+            if meta.segments.iter().any(|r| r.first_block == *head) {
+                crate::shared::publish(index, *head, bytes);
+            }
+        }
+    }
 }
 
 /// Size tiers for merging: a segment of `len` bytes is in tier
@@ -321,7 +343,7 @@ fn tier(len: u64) -> u32 {
 /// the metapage lock, under the flush mutex: VACUUM's pass 1 may clear
 /// liveness bits of the inputs meanwhile, but the merged segment has a new
 /// id, so that VACUUM's pass 2 (which waits for the mutex) vacuums it too.
-unsafe fn merge_small_segments(index: pg_sys::Relation, meta: &mut Meta, written: &mut Vec<(u32, u32)>) {
+unsafe fn merge_small_segments(index: pg_sys::Relation, meta: &mut Meta, written: &mut Written) {
     loop {
         let mut by_tier: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
         for (i, r) in meta.segments.iter().enumerate() {
@@ -369,8 +391,13 @@ unsafe fn free_retired(index: pg_sys::Relation) {
     }
     let blocks: Vec<u32> =
         meta.retired.iter().flat_map(|&(head, n)| storage::chain_blocks(index, head, n)).collect();
+    let heads: Vec<u32> = meta.retired.iter().map(|&(head, _)| head).collect();
     meta.retired.clear();
     lock.write(index, &meta);
+    drop(lock);
+    // Before the pages can be reused: no backend may map an old copy under
+    // a head block that a new segment then gets.
+    crate::shared::forget(index, &heads);
     storage::free_pages(index, &blocks);
 }
 

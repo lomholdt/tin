@@ -20,6 +20,7 @@
 //! ```
 
 pub mod bitmap;
+pub mod bytes;
 pub mod cursor;
 pub mod index;
 pub mod pattern;

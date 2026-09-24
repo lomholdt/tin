@@ -399,19 +399,38 @@ pub unsafe fn write_empty_init_fork(index: pg_sys::Relation) {
 
 /// The data of the `n`-page chain starting at `head` (`len` bytes).
 pub unsafe fn read_blob(index: pg_sys::Relation, head: u32, n: u32, len: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len as usize);
+    let mut out = vec![0u8; len as usize];
+    read_blob_into(index, head, n, &mut out);
+    out
+}
+
+/// The first bytes (up to one page's worth) of the blob at `head`.
+pub unsafe fn read_blob_prefix(index: pg_sys::Relation, head: u32) -> Vec<u8> {
+    let buf = read_locked(index, head, pg_sys::BUFFER_LOCK_SHARE);
+    let page = pg_sys::BufferGetPage(buf.0);
+    let data = payload_len(page).saturating_sub(CHAIN_HEADER);
+    std::slice::from_raw_parts(payload_ptr(page).add(CHAIN_HEADER), data).to_vec()
+}
+
+/// [`read_blob`] into `out`, which must be exactly the blob's length.
+pub unsafe fn read_blob_into(index: pg_sys::Relation, head: u32, n: u32, out: &mut [u8]) {
+    let mut at = 0usize;
     let mut blk = head;
     for _ in 0..n {
         let buf = read_locked(index, blk, pg_sys::BUFFER_LOCK_SHARE);
         let page = pg_sys::BufferGetPage(buf.0);
         let data = payload_len(page).saturating_sub(CHAIN_HEADER);
-        out.extend_from_slice(std::slice::from_raw_parts(payload_ptr(page).add(CHAIN_HEADER), data));
+        if at + data > out.len() {
+            pgrx::error!("tin: page chain at block {head} is longer than {} bytes", out.len());
+        }
+        out[at..at + data]
+            .copy_from_slice(std::slice::from_raw_parts(payload_ptr(page).add(CHAIN_HEADER), data));
+        at += data;
         blk = u32_in_payload(page, 0);
     }
-    if out.len() as u64 != len {
-        pgrx::error!("tin: page chain at block {head} holds {} bytes, expected {len}", out.len());
+    if at != out.len() {
+        pgrx::error!("tin: page chain at block {head} holds {at} bytes, expected {}", out.len());
     }
-    out
 }
 
 pub fn words_to_bytes(words: &[u64]) -> Vec<u8> {
