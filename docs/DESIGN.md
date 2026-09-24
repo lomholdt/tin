@@ -165,7 +165,8 @@ Single-term patterns (Phase 4) combine with all of the above:
 
 ## Analyzer
 
-- UAX #29 word boundaries (`unicode-segmentation`), lower-casing, and NFKD accent stripping.
+- UAX #29 word boundaries, lower-casing, and NFKD accent stripping.
+- 🔧 **Fast, exact word splitting** (`tokenize::for_each_word`): ASCII text goes through a bitmask implementation of the UAX #29 rules that apply to ASCII (AVX2 when available). Pieces around non-ASCII bytes go through `unicode-segmentation`, cut only where UAX #29 must break and no rule looks across. The output is identical to `unicode_word_indices` (differential test; 0 differences on 1.24M posts), 5× faster on English text.
 - ✅ No stemming and no stop words by default. The post explains why ("The Who").
 - Tokens over 64 bytes are dropped: hashes, base64 blobs.
 - Word positions (and byte offsets, for highlighting) are produced alongside terms; phrases and proximity are checked against them.

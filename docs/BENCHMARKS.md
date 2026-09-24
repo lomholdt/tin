@@ -171,17 +171,35 @@ The 1.24M Super User posts (842 MB of text) in PostgreSQL 18, tin vs Postgres fu
 
 | Kind | Matches (avg) | tin `count` p50 / p90 | Postgres `count` p50 / p90 | tin top 10 p50 / p90 | Postgres top 10 p50 / p90 |
 |---|---:|---:|---:|---:|---:|
-| `a b c` (AND) | 5,111 | 11 / 95 ms | 10 / 71 ms | 53 / 601 ms | 250 / 2,763 ms |
-| `"a b c"` | 32 | 70 / 519 ms | 294 / 2,071 ms | 56 / 360 ms | 303 / 2,026 ms |
-| `"a b"` | 16,129 | 538 / 3,622 ms | 2,344 / 23,968 ms | 428 / 4,596 ms | 2,555 / 27,521 ms |
-| `a THEN/3 b` | 18,071 | 246 / 3,501 ms | 1,043 / 22,246 ms | 184 / 4,093 ms | 1,203 / 25,217 ms |
-| `a NEAR/5 b` | 32,973 | 595 / 4,027 ms | 2,789 / 25,828 ms | 763 / 6,609 ms | 3,584 / 38,069 ms |
+| `a b c` (AND) | 5,111 | 10 / 85 ms | 10 / 71 ms | 32 / 392 ms | 250 / 2,763 ms |
+| `"a b c"` | 32 | 38 / 264 ms | 294 / 2,071 ms | 24 / 160 ms | 303 / 2,026 ms |
+| `"a b"` | 16,129 | 325 / 1,863 ms | 2,344 / 23,968 ms | 239 / 2,435 ms | 2,555 / 27,521 ms |
+| `a THEN/3 b` | 18,071 | 145 / 1,808 ms | 1,043 / 22,246 ms | 100 / 2,249 ms | 1,203 / 25,217 ms |
+| `a NEAR/5 b` | 32,973 | 344 / 1,975 ms | 2,789 / 25,828 ms | 457 / 3,742 ms | 3,584 / 38,069 ms |
 
-- **tin is 4–6.5× faster** on everything that needs positions or a score. On plain AND counts, both engines answer from the index alone and tie.
+- **tin is 7–12.6× faster** (p50) on everything that needs positions or a score. On plain AND counts, both engines answer from the index alone and tie.
 - **Common words are still slow for both:** hundreds of milliseconds to seconds. `"a b"` with two frequent words means re-reading every post that has both. A positional index would fix that, at roughly 3× the index size (see [DESIGN](DESIGN.md#query-language)). WAND-style top-k would fix the ranked case.
-- **Recheck only the query's words.** The first version kept the positions of every word of each candidate row. Keeping only the query's words (`span::Wanted`) made positional queries 1.7–2× faster (`"a b"` p50: 994 → 538 ms).
+- **Where the time goes:** re-reading a row is almost all splitting it into words. Two rounds of speed-ups:
+  - **Recheck only the query's words.** The first version kept the positions of every word of each candidate row. Keeping only the query's words (`span::Wanted`) made positional queries 1.7–2× faster (`"a b"` p50: 994 → 538 ms).
+  - **A faster word splitter** (see below): another 1.7–2.3× (`"a b"` p50: 538 → 325 ms), and the index builds in 10.7 s instead of 13.9 s.
 - **Exact:** on 28 queries, the index returned the same rows as a sequential scan with the same operator: 58,676 rows, 0 differences.
 - **tin and Postgres don't always agree on counts,** even for AND (0.9% average difference on 2-word phrases). The cause is tokenization, not matching: Postgres's parser indexes `kernel-devel` as a whole word *and* its parts, so for Postgres "yum install kernel" is not a phrase in "yum install kernel-devel" (tin: 40 rows, Postgres: 5). It also splits `you're` and keeps URLs whole. tin follows Unicode word boundaries.
 - **The Super User index now builds in 13.9 s** with 4 threads (parallel `CREATE INDEX`), vs 35.5 s serial in Phase 1 on a faster host. It is 154 MB (GIN: 388 MB).
 
-The Postgres numbers are from the first run. The tin numbers are from a second run of the same queries on the same server, after the recheck change.
+The Postgres numbers are from the first run. The tin numbers are from a later run of the same queries on the same server, after both speed-ups.
+
+### The word splitter
+
+Splitting text into words (Unicode UAX #29, via `unicode-segmentation`) ran at ~130 MB/s, about 5 µs of every 710-byte post. `tokenize::for_each_word` now gives exactly the same words 5× faster:
+
+| On the 1.24M posts (884 MB) | Speed |
+|---|---:|
+| `unicode_word_indices` (before) | 125 MB/s |
+| `for_each_word` | 628 MB/s |
+| … its ASCII part alone (`ascii_words`) | 1,156 MB/s |
+| recheck of `"and the"` per post, splitting + matching | 8.2 → 3.9 µs |
+
+- **ASCII, branch-light:** 94% of posts are pure ASCII. For those, UAX #29 comes down to a few local rules (letters, digits and `_` join; `.` `'` `:` join letters; `.` `'` `,` `;` join digits). Each 64-byte block becomes bitmasks (with AVX2 when the CPU has it), and word edges fall out of shifts and trailing-zero counts. A byte-at-a-time loop was 5× slower because of branch mispredictions.
+- **Non-ASCII text** is cut into pieces where ASCII whitespace meets an ASCII non-space byte. UAX #29 always breaks there, and no rule looks across. Only the pieces around non-ASCII bytes go through `unicode-segmentation`.
+- **Exact:** a randomized test compares the result with `unicode_word_indices` on 200,000 strings mixing ASCII, marks, joiners, quotes and spaces, and it caught two cut rules that were almost right. On all 1.24M posts: 0 differences. Existing indexes stay valid.
+- **Pre-filter:** a recheck skips, before lower-casing and hashing, any ASCII word whose length and first letter match no query word.

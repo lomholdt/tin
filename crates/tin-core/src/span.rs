@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::pattern::osa_within;
 use crate::query::{Query, Slot};
-use crate::tokenize::Analyzer;
+use crate::tokenize::{Analyzer, MAX_TERM_BYTES};
 
 fn hash(t: &str) -> u64 {
     use std::hash::{BuildHasher, BuildHasherDefault};
@@ -45,13 +45,33 @@ pub struct Wanted {
     all: bool,
     /// Also count the document's distinct terms (for scoring).
     count: bool,
+    /// Per length (up to `MAX_TERM_BYTES`), the first bytes of the wanted
+    /// ASCII terms: an ASCII word matching neither is skipped unfolded.
+    first_bytes: Vec<[u64; 4]>,
 }
 
 impl Wanted {
     pub fn new(q: &Query) -> Wanted {
-        let mut w = Wanted { terms: FxHashSet::default(), all: false, count: false };
+        let mut w = Wanted { terms: FxHashSet::default(), all: false, count: false, first_bytes: Vec::new() };
         w.add(q);
+        w.first_bytes = vec![[0u64; 4]; MAX_TERM_BYTES + 1];
+        for t in w.terms.iter().filter(|t| t.is_ascii() && t.len() <= MAX_TERM_BYTES) {
+            let b = t.as_bytes()[0];
+            w.first_bytes[t.len()][(b >> 6) as usize] |= 1 << (b & 63);
+        }
         w
+    }
+
+    /// Whether raw word `w` may fold to a wanted term. Folding an ASCII word
+    /// only lower-cases it, so its length and lower-cased first byte decide;
+    /// other words are always folded and looked up.
+    #[inline]
+    fn may_want(&self, w: &str) -> bool {
+        if !w.is_ascii() {
+            return true;
+        }
+        let b = w.as_bytes()[0].to_ascii_lowercase();
+        self.first_bytes.get(w.len()).is_some_and(|set| set[(b >> 6) as usize] >> (b & 63) & 1 == 1)
     }
 
     /// Like [`new`](Self::new), and [`DocWords::distinct_terms`] counts every
@@ -89,6 +109,26 @@ impl DocWords {
     /// counts all of the document's terms only if `wanted` is
     /// [`counting`](Wanted::counting).
     pub fn with(text: &str, analyzer: &mut Analyzer, wanted: &Wanted) -> DocWords {
+        if !wanted.all && !wanted.count {
+            // The recheck's path: other words are skipped before folding.
+            let mut terms: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+            let words = analyzer.for_each_term_if(
+                text,
+                |w| wanted.may_want(w),
+                |t, pos| {
+                    if wanted.terms.contains(t) {
+                        match terms.get_mut(t) {
+                            Some(v) => v.push(pos),
+                            None => {
+                                terms.insert(t.to_owned(), vec![pos]);
+                            }
+                        }
+                    }
+                },
+            );
+            let distinct = terms.len();
+            return DocWords { terms, words, distinct };
+        }
         Self::build(text, analyzer, (!wanted.all).then_some(&wanted.terms), wanted.count)
     }
 

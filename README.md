@@ -39,7 +39,7 @@ SELECT * FROM shipments WHERE search_text ~> 'MSKU60128' ORDER BY search_text <~
 | Speed (4 threads, COUNT) | 11k–22k queries/s, 1.5–2.4× an uncompressed in-RAM baseline; p99 ≈ 1.4 ms or better |
 | In PostgreSQL 18 vs GIN | build 35.5 s vs 55.8 s; size 157 MB vs 388 MB; median 2.2–2.5× faster on selective queries; index = seqscan on 40/40 sampled queries |
 | 5M shipping IDs vs plain Postgres / Typesense | ranked search box, p99 ≤ 2 ms for every query kind at `tin.search_typos = 1`; best recall of the three (fragments 98–100% hit@10, typos 100%) ([details](docs/BENCHMARKS-IDS.md)) |
-| Phrases, proximity, BM25 top 10 (1.24M posts) | 4–6.5× faster than Postgres full-text search; same rows as a sequential scan ([details](docs/BENCHMARKS.md#phase-8-phrases-proximity-and-scoring)) |
+| Phrases, proximity, BM25 top 10 (1.24M posts) | 7–12.6× faster than Postgres full-text search; same rows as a sequential scan ([details](docs/BENCHMARKS.md#phase-8-phrases-proximity-and-scoring)) |
 | Update storm (a day's 700k updates in 168 s, hot rows) | 0 wrong results; 4,170 updates/s vs 3,043 for plain Postgres; index size stable; search p99 6.8 ms during the storm ([details](docs/BENCHMARKS-IDS.md#phase-6-update-storm)) |
 
 The details, including where we deviate from the posts and why, are in:
@@ -53,7 +53,7 @@ The details, including where we deviate from the posts and why, are in:
 ```text
 crates/tin-core    storage format + query engine (library)
   tid.rs           ctid type
-  tokenize.rs      analyzer (UAX #29, case + accent folding)
+  tokenize.rs      analyzer: fast exact UAX #29 word splitting, case + accent folding
   bitmap.rs        256-bit page / 512-bit offset bitsets, run iteration
   postings.rs      singleton / sparse / two-level-bitmap encodings + readers
   cursor.rs        group-at-a-time AND / OR / NOT over tuple-space bitmaps

@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+unicode-segmentation = "1"
 tin-core.workspace = true
 rayon = "1"
 rustc-hash = "2"
