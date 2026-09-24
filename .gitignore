@@ -4,3 +4,6 @@
 *.7z
 *.xml
 *.docs.txt
+
+# Benchmark outputs
+/bench/text/text_results_*.tsv

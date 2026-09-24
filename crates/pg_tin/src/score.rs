@@ -104,11 +104,15 @@ fn with_scorer<R>(index: pg_sys::Oid, query: &str, f: impl FnOnce(&Cached) -> R)
 }
 
 pub fn explain(index: pg_sys::Oid, doc: &str, query: &str) -> Explanation {
-    with_scorer(index, query, |c| c.scorer.explain(&DocWords::new(doc, &mut Analyzer::new()), &c.stats))
+    with_scorer(index, query, |c| {
+        c.scorer.explain(&DocWords::with(doc, &mut Analyzer::new(), c.scorer.wanted()), &c.stats)
+    })
 }
 
 pub fn score(index: pg_sys::Oid, doc: &str, query: &str) -> f64 {
-    with_scorer(index, query, |c| c.scorer.score(&DocWords::new(doc, &mut Analyzer::new()), &c.stats))
+    with_scorer(index, query, |c| {
+        c.scorer.score(&DocWords::with(doc, &mut Analyzer::new(), c.scorer.wanted()), &c.stats)
+    })
 }
 
 /// Whether `doc` matches (for the inspection output).

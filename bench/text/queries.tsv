@@ -1,0 +1,250 @@
+phrase2	"any problem"	any <-> problem
+phrase2	"did take"	did <-> take
+phrase2	"has insufficient"	has <-> insufficient
+phrase2	"and would"	and <-> would
+phrase2	"the disk"	the <-> disk
+phrase2	"manually result"	manually <-> result
+phrase2	"the name"	the <-> name
+phrase2	"this runs"	this <-> runs
+phrase2	"and the"	and <-> the
+phrase2	"the keyboard"	the <-> keyboard
+phrase2	"you could"	you <-> could
+phrase2	"via usb"	via <-> usb
+phrase2	"performance than"	performance <-> than
+phrase2	"brew install"	brew <-> install
+phrase2	"the router"	the <-> router
+phrase2	"cause any"	cause <-> any
+phrase2	"the folders"	the <-> folders
+phrase2	"business hours"	business <-> hours
+phrase2	"synchronize lyrics"	synchronize <-> lyrics
+phrase2	"mine has"	mine <-> has
+phrase2	"command prompt"	command <-> prompt
+phrase2	"interface currently"	interface <-> currently
+phrase2	"like this"	like <-> this
+phrase2	"you are"	you <-> are
+phrase2	"opening the"	opening <-> the
+phrase2	"although personally"	although <-> personally
+phrase2	"recover directory"	recover <-> directory
+phrase2	"this will"	this <-> will
+phrase2	"have any"	have <-> any
+phrase2	"trust that"	trust <-> that
+phrase2	"one process"	one <-> process
+phrase2	"there any"	there <-> any
+phrase2	"locking the"	locking <-> the
+phrase2	"vedio and"	vedio <-> and
+phrase2	"running the"	running <-> the
+phrase2	"livecd and"	livecd <-> and
+phrase2	"computer defaults"	computer <-> defaults
+phrase2	"kernel options"	kernel <-> options
+phrase2	"key from"	key <-> from
+phrase2	"would like"	would <-> like
+phrase2	"usually set"	usually <-> set
+phrase2	"you can"	you <-> can
+phrase2	"that you"	that <-> you
+phrase2	"ethernet and"	ethernet <-> and
+phrase2	"with syslinux"	with <-> syslinux
+phrase2	"select the"	select <-> the
+phrase2	"create the"	create <-> the
+phrase2	"play the"	play <-> the
+phrase2	"this brand"	this <-> brand
+phrase2	"deletes them"	deletes <-> them
+phrase3	"checking the display"	checking <-> the <-> display
+phrase3	"not the cause"	not <-> the <-> cause
+phrase3	"and price class"	and <-> price <-> class
+phrase3	"monitor process and"	monitor <-> process <-> and
+phrase3	"their user agent"	their <-> user <-> agent
+phrase3	"see graphically what"	see <-> graphically <-> what
+phrase3	"from parallels with"	from <-> parallels <-> with
+phrase3	"the boot tab"	the <-> boot <-> tab
+phrase3	"despite already having"	despite <-> already <-> having
+phrase3	"configure xbox media"	configure <-> xbox <-> media
+phrase3	"use your window"	use <-> your <-> window
+phrase3	"secondary router having"	secondary <-> router <-> having
+phrase3	"first time the"	first <-> time <-> the
+phrase3	"the below answers"	the <-> below <-> answers
+phrase3	"implementation and configuration"	implementation <-> and <-> configuration
+phrase3	"complete the installation"	complete <-> the <-> installation
+phrase3	"use windows performance"	use <-> windows <-> performance
+phrase3	"taken out yours"	taken <-> out <-> yours
+phrase3	"hold for another"	hold <-> for <-> another
+phrase3	"boot from and"	boot <-> from <-> and
+phrase3	"you their resources"	you <-> their <-> resources
+phrase3	"other important information"	other <-> important <-> information
+phrase3	"this with python"	this <-> with <-> python
+phrase3	"the usleep function"	the <-> usleep <-> function
+phrase3	"the project within"	the <-> project <-> within
+phrase3	"but windows does"	but <-> windows <-> does
+phrase3	"graphic driver update"	graphic <-> driver <-> update
+phrase3	"its original device"	its <-> original <-> device
+phrase3	"lot more free"	lot <-> more <-> free
+phrase3	"during the setup"	during <-> the <-> setup
+phrase3	"program which uses"	program <-> which <-> uses
+phrase3	"preferences make sure"	preferences <-> make <-> sure
+phrase3	"google for specific"	google <-> for <-> specific
+phrase3	"selections allowed without"	selections <-> allowed <-> without
+phrase3	"other pages for"	other <-> pages <-> for
+phrase3	"how come the"	how <-> come <-> the
+phrase3	"include setup packages"	include <-> setup <-> packages
+phrase3	"startup for this"	startup <-> for <-> this
+phrase3	"would recommend going"	would <-> recommend <-> going
+phrase3	"significantly improve throughput"	significantly <-> improve <-> throughput
+phrase3	"all the defaults"	all <-> the <-> defaults
+phrase3	"drive the directory"	drive <-> the <-> directory
+phrase3	"opt for the"	opt <-> for <-> the
+phrase3	"vmware workstation installs"	vmware <-> workstation <-> installs
+phrase3	"big enough that"	big <-> enough <-> that
+phrase3	"worked was the"	worked <-> was <-> the
+phrase3	"solution because the"	solution <-> because <-> the
+phrase3	"had almost the"	had <-> almost <-> the
+phrase3	"yum install kernel"	yum <-> install <-> kernel
+phrase3	"the auto configuration"	the <-> auto <-> configuration
+near5	the NEAR/5 sound	(the <1> sound) | (the <2> sound) | (the <3> sound) | (the <4> sound) | (the <5> sound) | (the <6> sound) | (sound <1> the) | (sound <2> the) | (sound <3> the) | (sound <4> the) | (sound <5> the) | (sound <6> the)
+near5	login NEAR/5 being	(login <1> being) | (login <2> being) | (login <3> being) | (login <4> being) | (login <5> being) | (login <6> being) | (being <1> login) | (being <2> login) | (being <3> login) | (being <4> login) | (being <5> login) | (being <6> login)
+near5	use NEAR/5 export	(use <1> export) | (use <2> export) | (use <3> export) | (use <4> export) | (use <5> export) | (use <6> export) | (export <1> use) | (export <2> use) | (export <3> use) | (export <4> use) | (export <5> use) | (export <6> use)
+near5	get NEAR/5 into	(get <1> into) | (get <2> into) | (get <3> into) | (get <4> into) | (get <5> into) | (get <6> into) | (into <1> get) | (into <2> get) | (into <3> get) | (into <4> get) | (into <5> get) | (into <6> get)
+near5	you NEAR/5 too	(you <1> too) | (you <2> too) | (you <3> too) | (you <4> too) | (you <5> too) | (you <6> too) | (too <1> you) | (too <2> you) | (too <3> you) | (too <4> you) | (too <5> you) | (too <6> you)
+near5	and NEAR/5 will	(and <1> will) | (and <2> will) | (and <3> will) | (and <4> will) | (and <5> will) | (and <6> will) | (will <1> and) | (will <2> and) | (will <3> and) | (will <4> and) | (will <5> and) | (will <6> and)
+near5	change NEAR/5 this	(change <1> this) | (change <2> this) | (change <3> this) | (change <4> this) | (change <5> this) | (change <6> this) | (this <1> change) | (this <2> change) | (this <3> change) | (this <4> change) | (this <5> change) | (this <6> change)
+near5	and NEAR/5 slow	(and <1> slow) | (and <2> slow) | (and <3> slow) | (and <4> slow) | (and <5> slow) | (and <6> slow) | (slow <1> and) | (slow <2> and) | (slow <3> and) | (slow <4> and) | (slow <5> and) | (slow <6> and)
+near5	all NEAR/5 files	(all <1> files) | (all <2> files) | (all <3> files) | (all <4> files) | (all <5> files) | (all <6> files) | (files <1> all) | (files <2> all) | (files <3> all) | (files <4> all) | (files <5> all) | (files <6> all)
+near5	usually NEAR/5 they	(usually <1> they) | (usually <2> they) | (usually <3> they) | (usually <4> they) | (usually <5> they) | (usually <6> they) | (they <1> usually) | (they <2> usually) | (they <3> usually) | (they <4> usually) | (they <5> usually) | (they <6> usually)
+near5	was NEAR/5 possible	(was <1> possible) | (was <2> possible) | (was <3> possible) | (was <4> possible) | (was <5> possible) | (was <6> possible) | (possible <1> was) | (possible <2> was) | (possible <3> was) | (possible <4> was) | (possible <5> was) | (possible <6> was)
+near5	which NEAR/5 same	(which <1> same) | (which <2> same) | (which <3> same) | (which <4> same) | (which <5> same) | (which <6> same) | (same <1> which) | (same <2> which) | (same <3> which) | (same <4> which) | (same <5> which) | (same <6> which)
+near5	folder NEAR/5 and	(folder <1> and) | (folder <2> and) | (folder <3> and) | (folder <4> and) | (folder <5> and) | (folder <6> and) | (and <1> folder) | (and <2> folder) | (and <3> folder) | (and <4> folder) | (and <5> folder) | (and <6> folder)
+near5	play NEAR/5 and	(play <1> and) | (play <2> and) | (play <3> and) | (play <4> and) | (play <5> and) | (play <6> and) | (and <1> play) | (and <2> play) | (and <3> play) | (and <4> play) | (and <5> play) | (and <6> play)
+near5	name NEAR/5 all	(name <1> all) | (name <2> all) | (name <3> all) | (name <4> all) | (name <5> all) | (name <6> all) | (all <1> name) | (all <2> name) | (all <3> name) | (all <4> name) | (all <5> name) | (all <6> name)
+near5	firefox NEAR/5 the	(firefox <1> the) | (firefox <2> the) | (firefox <3> the) | (firefox <4> the) | (firefox <5> the) | (firefox <6> the) | (the <1> firefox) | (the <2> firefox) | (the <3> firefox) | (the <4> firefox) | (the <5> firefox) | (the <6> firefox)
+near5	accepted NEAR/5 trying	(accepted <1> trying) | (accepted <2> trying) | (accepted <3> trying) | (accepted <4> trying) | (accepted <5> trying) | (accepted <6> trying) | (trying <1> accepted) | (trying <2> accepted) | (trying <3> accepted) | (trying <4> accepted) | (trying <5> accepted) | (trying <6> accepted)
+near5	the NEAR/5 needed	(the <1> needed) | (the <2> needed) | (the <3> needed) | (the <4> needed) | (the <5> needed) | (the <6> needed) | (needed <1> the) | (needed <2> the) | (needed <3> the) | (needed <4> the) | (needed <5> the) | (needed <6> the)
+near5	can NEAR/5 the	(can <1> the) | (can <2> the) | (can <3> the) | (can <4> the) | (can <5> the) | (can <6> the) | (the <1> can) | (the <2> can) | (the <3> can) | (the <4> can) | (the <5> can) | (the <6> can)
+near5	that NEAR/5 file	(that <1> file) | (that <2> file) | (that <3> file) | (that <4> file) | (that <5> file) | (that <6> file) | (file <1> that) | (file <2> that) | (file <3> that) | (file <4> that) | (file <5> that) | (file <6> that)
+near5	the NEAR/5 given	(the <1> given) | (the <2> given) | (the <3> given) | (the <4> given) | (the <5> given) | (the <6> given) | (given <1> the) | (given <2> the) | (given <3> the) | (given <4> the) | (given <5> the) | (given <6> the)
+near5	from NEAR/5 one	(from <1> one) | (from <2> one) | (from <3> one) | (from <4> one) | (from <5> one) | (from <6> one) | (one <1> from) | (one <2> from) | (one <3> from) | (one <4> from) | (one <5> from) | (one <6> from)
+near5	the NEAR/5 get	(the <1> get) | (the <2> get) | (the <3> get) | (the <4> get) | (the <5> get) | (the <6> get) | (get <1> the) | (get <2> the) | (get <3> the) | (get <4> the) | (get <5> the) | (get <6> the)
+near5	back NEAR/5 data	(back <1> data) | (back <2> data) | (back <3> data) | (back <4> data) | (back <5> data) | (back <6> data) | (data <1> back) | (data <2> back) | (data <3> back) | (data <4> back) | (data <5> back) | (data <6> back)
+near5	system NEAR/5 scan	(system <1> scan) | (system <2> scan) | (system <3> scan) | (system <4> scan) | (system <5> scan) | (system <6> scan) | (scan <1> system) | (scan <2> system) | (scan <3> system) | (scan <4> system) | (scan <5> system) | (scan <6> system)
+near5	the NEAR/5 computer	(the <1> computer) | (the <2> computer) | (the <3> computer) | (the <4> computer) | (the <5> computer) | (the <6> computer) | (computer <1> the) | (computer <2> the) | (computer <3> the) | (computer <4> the) | (computer <5> the) | (computer <6> the)
+near5	administrator NEAR/5 and	(administrator <1> and) | (administrator <2> and) | (administrator <3> and) | (administrator <4> and) | (administrator <5> and) | (administrator <6> and) | (and <1> administrator) | (and <2> administrator) | (and <3> administrator) | (and <4> administrator) | (and <5> administrator) | (and <6> administrator)
+near5	with NEAR/5 line	(with <1> line) | (with <2> line) | (with <3> line) | (with <4> line) | (with <5> line) | (with <6> line) | (line <1> with) | (line <2> with) | (line <3> with) | (line <4> with) | (line <5> with) | (line <6> with)
+near5	one NEAR/5 other	(one <1> other) | (one <2> other) | (one <3> other) | (one <4> other) | (one <5> other) | (one <6> other) | (other <1> one) | (other <2> one) | (other <3> one) | (other <4> one) | (other <5> one) | (other <6> one)
+near5	these NEAR/5 machines	(these <1> machines) | (these <2> machines) | (these <3> machines) | (these <4> machines) | (these <5> machines) | (these <6> machines) | (machines <1> these) | (machines <2> these) | (machines <3> these) | (machines <4> these) | (machines <5> these) | (machines <6> these)
+near5	server NEAR/5 ssh	(server <1> ssh) | (server <2> ssh) | (server <3> ssh) | (server <4> ssh) | (server <5> ssh) | (server <6> ssh) | (ssh <1> server) | (ssh <2> server) | (ssh <3> server) | (ssh <4> server) | (ssh <5> server) | (ssh <6> server)
+near5	active NEAR/5 then	(active <1> then) | (active <2> then) | (active <3> then) | (active <4> then) | (active <5> then) | (active <6> then) | (then <1> active) | (then <2> active) | (then <3> active) | (then <4> active) | (then <5> active) | (then <6> active)
+near5	and NEAR/5 drop	(and <1> drop) | (and <2> drop) | (and <3> drop) | (and <4> drop) | (and <5> drop) | (and <6> drop) | (drop <1> and) | (drop <2> and) | (drop <3> and) | (drop <4> and) | (drop <5> and) | (drop <6> and)
+near5	desktop NEAR/5 graphics	(desktop <1> graphics) | (desktop <2> graphics) | (desktop <3> graphics) | (desktop <4> graphics) | (desktop <5> graphics) | (desktop <6> graphics) | (graphics <1> desktop) | (graphics <2> desktop) | (graphics <3> desktop) | (graphics <4> desktop) | (graphics <5> desktop) | (graphics <6> desktop)
+near5	would NEAR/5 assume	(would <1> assume) | (would <2> assume) | (would <3> assume) | (would <4> assume) | (would <5> assume) | (would <6> assume) | (assume <1> would) | (assume <2> would) | (assume <3> would) | (assume <4> would) | (assume <5> would) | (assume <6> would)
+near5	when NEAR/5 over	(when <1> over) | (when <2> over) | (when <3> over) | (when <4> over) | (when <5> over) | (when <6> over) | (over <1> when) | (over <2> when) | (over <3> when) | (over <4> when) | (over <5> when) | (over <6> when)
+near5	field NEAR/5 sufficiently	(field <1> sufficiently) | (field <2> sufficiently) | (field <3> sufficiently) | (field <4> sufficiently) | (field <5> sufficiently) | (field <6> sufficiently) | (sufficiently <1> field) | (sufficiently <2> field) | (sufficiently <3> field) | (sufficiently <4> field) | (sufficiently <5> field) | (sufficiently <6> field)
+near5	guide NEAR/5 with	(guide <1> with) | (guide <2> with) | (guide <3> with) | (guide <4> with) | (guide <5> with) | (guide <6> with) | (with <1> guide) | (with <2> guide) | (with <3> guide) | (with <4> guide) | (with <5> guide) | (with <6> guide)
+near5	repo NEAR/5 using	(repo <1> using) | (repo <2> using) | (repo <3> using) | (repo <4> using) | (repo <5> using) | (repo <6> using) | (using <1> repo) | (using <2> repo) | (using <3> repo) | (using <4> repo) | (using <5> repo) | (using <6> repo)
+near5	not NEAR/5 have	(not <1> have) | (not <2> have) | (not <3> have) | (not <4> have) | (not <5> have) | (not <6> have) | (have <1> not) | (have <2> not) | (have <3> not) | (have <4> not) | (have <5> not) | (have <6> not)
+near5	more NEAR/5 info	(more <1> info) | (more <2> info) | (more <3> info) | (more <4> info) | (more <5> info) | (more <6> info) | (info <1> more) | (info <2> more) | (info <3> more) | (info <4> more) | (info <5> more) | (info <6> more)
+near5	kill NEAR/5 with	(kill <1> with) | (kill <2> with) | (kill <3> with) | (kill <4> with) | (kill <5> with) | (kill <6> with) | (with <1> kill) | (with <2> kill) | (with <3> kill) | (with <4> kill) | (with <5> kill) | (with <6> kill)
+near5	you NEAR/5 the	(you <1> the) | (you <2> the) | (you <3> the) | (you <4> the) | (you <5> the) | (you <6> the) | (the <1> you) | (the <2> you) | (the <3> you) | (the <4> you) | (the <5> you) | (the <6> you)
+near5	the NEAR/5 for	(the <1> for) | (the <2> for) | (the <3> for) | (the <4> for) | (the <5> for) | (the <6> for) | (for <1> the) | (for <2> the) | (for <3> the) | (for <4> the) | (for <5> the) | (for <6> the)
+near5	the NEAR/5 trash	(the <1> trash) | (the <2> trash) | (the <3> trash) | (the <4> trash) | (the <5> trash) | (the <6> trash) | (trash <1> the) | (trash <2> the) | (trash <3> the) | (trash <4> the) | (trash <5> the) | (trash <6> the)
+near5	you NEAR/5 did	(you <1> did) | (you <2> did) | (you <3> did) | (you <4> did) | (you <5> did) | (you <6> did) | (did <1> you) | (did <2> you) | (did <3> you) | (did <4> you) | (did <5> you) | (did <6> you)
+near5	bookmarks NEAR/5 only	(bookmarks <1> only) | (bookmarks <2> only) | (bookmarks <3> only) | (bookmarks <4> only) | (bookmarks <5> only) | (bookmarks <6> only) | (only <1> bookmarks) | (only <2> bookmarks) | (only <3> bookmarks) | (only <4> bookmarks) | (only <5> bookmarks) | (only <6> bookmarks)
+near5	mir NEAR/5 parameter	(mir <1> parameter) | (mir <2> parameter) | (mir <3> parameter) | (mir <4> parameter) | (mir <5> parameter) | (mir <6> parameter) | (parameter <1> mir) | (parameter <2> mir) | (parameter <3> mir) | (parameter <4> mir) | (parameter <5> mir) | (parameter <6> mir)
+near5	the NEAR/5 expanded	(the <1> expanded) | (the <2> expanded) | (the <3> expanded) | (the <4> expanded) | (the <5> expanded) | (the <6> expanded) | (expanded <1> the) | (expanded <2> the) | (expanded <3> the) | (expanded <4> the) | (expanded <5> the) | (expanded <6> the)
+near5	remote NEAR/5 with	(remote <1> with) | (remote <2> with) | (remote <3> with) | (remote <4> with) | (remote <5> with) | (remote <6> with) | (with <1> remote) | (with <2> remote) | (with <3> remote) | (with <4> remote) | (with <5> remote) | (with <6> remote)
+then3	exact THEN/3 images	(exact <1> images) | (exact <2> images) | (exact <3> images) | (exact <4> images)
+then3	servers THEN/3 hosts	(servers <1> hosts) | (servers <2> hosts) | (servers <3> hosts) | (servers <4> hosts)
+then3	the THEN/3 card	(the <1> card) | (the <2> card) | (the <3> card) | (the <4> card)
+then3	specific THEN/3 only	(specific <1> only) | (specific <2> only) | (specific <3> only) | (specific <4> only)
+then3	sqlite THEN/3 driver	(sqlite <1> driver) | (sqlite <2> driver) | (sqlite <3> driver) | (sqlite <4> driver)
+then3	using THEN/3 fireware	(using <1> fireware) | (using <2> fireware) | (using <3> fireware) | (using <4> fireware)
+then3	cut THEN/3 commercials	(cut <1> commercials) | (cut <2> commercials) | (cut <3> commercials) | (cut <4> commercials)
+then3	ups THEN/3 itself	(ups <1> itself) | (ups <2> itself) | (ups <3> itself) | (ups <4> itself)
+then3	kill THEN/3 the	(kill <1> the) | (kill <2> the) | (kill <3> the) | (kill <4> the)
+then3	specific THEN/3 needed	(specific <1> needed) | (specific <2> needed) | (specific <3> needed) | (specific <4> needed)
+then3	than THEN/3 unrelated	(than <1> unrelated) | (than <2> unrelated) | (than <3> unrelated) | (than <4> unrelated)
+then3	maybe THEN/3 something	(maybe <1> something) | (maybe <2> something) | (maybe <3> something) | (maybe <4> something)
+then3	and THEN/3 the	(and <1> the) | (and <2> the) | (and <3> the) | (and <4> the)
+then3	need THEN/3 driver	(need <1> driver) | (need <2> driver) | (need <3> driver) | (need <4> driver)
+then3	the THEN/3 sum	(the <1> sum) | (the <2> sum) | (the <3> sum) | (the <4> sum)
+then3	for THEN/3 the	(for <1> the) | (for <2> the) | (for <3> the) | (for <4> the)
+then3	recovery THEN/3 from	(recovery <1> from) | (recovery <2> from) | (recovery <3> from) | (recovery <4> from)
+then3	similar THEN/3 solve	(similar <1> solve) | (similar <2> solve) | (similar <3> solve) | (similar <4> solve)
+then3	mobile THEN/3 operators	(mobile <1> operators) | (mobile <2> operators) | (mobile <3> operators) | (mobile <4> operators)
+then3	update THEN/3 uis	(update <1> uis) | (update <2> uis) | (update <3> uis) | (update <4> uis)
+then3	but THEN/3 some	(but <1> some) | (but <2> some) | (but <3> some) | (but <4> some)
+then3	for THEN/3 one	(for <1> one) | (for <2> one) | (for <3> one) | (for <4> one)
+then3	the THEN/3 which	(the <1> which) | (the <2> which) | (the <3> which) | (the <4> which)
+then3	home THEN/3 directory	(home <1> directory) | (home <2> directory) | (home <3> directory) | (home <4> directory)
+then3	hear THEN/3 sound	(hear <1> sound) | (hear <2> sound) | (hear <3> sound) | (hear <4> sound)
+then3	disappear THEN/3 the	(disappear <1> the) | (disappear <2> the) | (disappear <3> the) | (disappear <4> the)
+then3	clients THEN/3 refuse	(clients <1> refuse) | (clients <2> refuse) | (clients <3> refuse) | (clients <4> refuse)
+then3	system THEN/3 update	(system <1> update) | (system <2> update) | (system <3> update) | (system <4> update)
+then3	keep THEN/3 remain	(keep <1> remain) | (keep <2> remain) | (keep <3> remain) | (keep <4> remain)
+then3	this THEN/3 way	(this <1> way) | (this <2> way) | (this <3> way) | (this <4> way)
+then3	can THEN/3 delete	(can <1> delete) | (can <2> delete) | (can <3> delete) | (can <4> delete)
+then3	case THEN/3 you	(case <1> you) | (case <2> you) | (case <3> you) | (case <4> you)
+then3	system THEN/3 task	(system <1> task) | (system <2> task) | (system <3> task) | (system <4> task)
+then3	select THEN/3 and	(select <1> and) | (select <2> and) | (select <3> and) | (select <4> and)
+then3	editing THEN/3 directly	(editing <1> directly) | (editing <2> directly) | (editing <3> directly) | (editing <4> directly)
+then3	and THEN/3 drop	(and <1> drop) | (and <2> drop) | (and <3> drop) | (and <4> drop)
+then3	edit THEN/3 hosts	(edit <1> hosts) | (edit <2> hosts) | (edit <3> hosts) | (edit <4> hosts)
+then3	have THEN/3 room	(have <1> room) | (have <2> room) | (have <3> room) | (have <4> room)
+then3	define THEN/3 then	(define <1> then) | (define <2> then) | (define <3> then) | (define <4> then)
+then3	the THEN/3 activates	(the <1> activates) | (the <2> activates) | (the <3> activates) | (the <4> activates)
+then3	know THEN/3 that	(know <1> that) | (know <2> that) | (know <3> that) | (know <4> that)
+then3	the THEN/3 cpu	(the <1> cpu) | (the <2> cpu) | (the <3> cpu) | (the <4> cpu)
+then3	were THEN/3 able	(were <1> able) | (were <2> able) | (were <3> able) | (were <4> able)
+then3	wide THEN/3 are	(wide <1> are) | (wide <2> are) | (wide <3> are) | (wide <4> are)
+then3	but THEN/3 and	(but <1> and) | (but <2> and) | (but <3> and) | (but <4> and)
+then3	then THEN/3 disappears	(then <1> disappears) | (then <2> disappears) | (then <3> disappears) | (then <4> disappears)
+then3	you THEN/3 use	(you <1> use) | (you <2> use) | (you <3> use) | (you <4> use)
+then3	settings THEN/3 internet	(settings <1> internet) | (settings <2> internet) | (settings <3> internet) | (settings <4> internet)
+then3	hot THEN/3 when	(hot <1> when) | (hot <2> when) | (hot <3> when) | (hot <4> when)
+then3	tell THEN/3 that	(tell <1> that) | (tell <2> that) | (tell <3> that) | (tell <4> that)
+and3	the current link	the & current & link
+and3	your mileage may	your & mileage & may
+and3	dumb quotes into	dumb & quotes & into
+and3	actual connection issue	actual & connection & issue
+and3	toolbox from view	toolbox & from & view
+and3	matches newline replace	matches & newline & replace
+and3	conditional formatting with	conditional & formatting & with
+and3	want them displayed	want & them & displayed
+and3	know anything about	know & anything & about
+and3	too sure though	too & sure & though
+and3	and lost all	and & lost & all
+and3	any help will	any & help & will
+and3	this affects both	this & affects & both
+and3	you can force	you & can & force
+and3	your computer will	your & computer & will
+and3	returned error code	returned & error & code
+and3	windows other than	windows & other & than
+and3	converted garage and	converted & garage & and
+and3	had the same	had & the & same
+and3	ghostcript for windows	ghostcript & for & windows
+and3	you can now	you & can & now
+and3	computer scans itself	computer & scans & itself
+and3	the message editor	the & message & editor
+and3	prominent factor due	prominent & factor & due
+and3	using the camera	using & the & camera
+and3	have that long	have & that & long
+and3	try formatting your	try & formatting & your
+and3	that sounds like	that & sounds & like
+and3	nic driver handle	nic & driver & handle
+and3	change the sort	change & the & sort
+and3	just saved the	just & saved & the
+and3	that may block	that & may & block
+and3	starting today and	starting & today & and
+and3	flash three times	flash & three & times
+and3	which tests the	which & tests & the
+and3	save session password	save & session & password
+and3	the player and	the & player & and
+and3	atx motherboard off	atx & motherboard & off
+and3	hopefully the issue	hopefully & the & issue
+and3	the evacopy project	the & evacopy & project
+and3	model charger cause	model & charger & cause
+and3	build the source	build & the & source
+and3	and leave some	and & leave & some
+and3	important processes run	important & processes & run
+and3	when reading your	when & reading & your
+and3	out where word	out & where & word
+and3	the documentation does	the & documentation & does
+and3	there are also	there & are & also
+and3	html help executable	html & help & executable
+and3	text editor the	text & editor & the

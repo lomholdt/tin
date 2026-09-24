@@ -162,3 +162,26 @@ Every step was checked against the baseline on the full corpus and against the r
 | 5 | callgrind: ~70% of AND time was varint-decoding mid-frequency sparse lists → bias the encoder to bitmaps for lists > 64 | Conj p50 ~165 → 118 µs for +10% index size |
 | 6 | callgrind: OR/NOT spent ~70% in the run finder, because mid-frequency terms have many 1-page runs. Replaced with word-parallel run boundaries (start/end bitmasks, two `tzcnt` per run), a whole-run fast path when every page of the term is wanted, and a single 8-byte load for copies of ≤ 57 bits | Negation p50 235 → 180 µs; disjunction COUNT p50 444 → 289 µs, QPS 8.8k → 11.0k; mixed 360 → 197 µs |
 | 7 | Emit tids page by page (extract each page's bits in one go) instead of locating the page for every bit; reserve output per group | Disjunction "all tids" p50 1.20 → 0.88 ms |
+
+## Phase 8: phrases, proximity and scoring
+
+The 1.24M Super User posts (842 MB of text) in PostgreSQL 18, tin vs Postgres full-text search: a GIN index on `to_tsvector('simple', body)`, queried with `@@` and ranked with `ts_rank`. Neither index stores word positions: GIN over a tsvector expression rechecks phrases against the row, as tin does. Setup and scripts are in [bench/text](../bench/text/README.md).
+
+**Queries:** 250, 50 per kind, sampled from real posts so each has matches, e.g. `"monitor process and"`, `folder NEAR/5 and`. They include very common words, which is where a positionless index hurts most. Each runs as `count(*)` (every match) and as the best 10 by score. The second of two passes is kept, on one core (no parallel workers).
+
+| Kind | Matches (avg) | tin `count` p50 / p90 | Postgres `count` p50 / p90 | tin top 10 p50 / p90 | Postgres top 10 p50 / p90 |
+|---|---:|---:|---:|---:|---:|
+| `a b c` (AND) | 5,111 | 11 / 95 ms | 10 / 71 ms | 53 / 601 ms | 250 / 2,763 ms |
+| `"a b c"` | 32 | 70 / 519 ms | 294 / 2,071 ms | 56 / 360 ms | 303 / 2,026 ms |
+| `"a b"` | 16,129 | 538 / 3,622 ms | 2,344 / 23,968 ms | 428 / 4,596 ms | 2,555 / 27,521 ms |
+| `a THEN/3 b` | 18,071 | 246 / 3,501 ms | 1,043 / 22,246 ms | 184 / 4,093 ms | 1,203 / 25,217 ms |
+| `a NEAR/5 b` | 32,973 | 595 / 4,027 ms | 2,789 / 25,828 ms | 763 / 6,609 ms | 3,584 / 38,069 ms |
+
+- **tin is 4–6.5× faster** on everything that needs positions or a score. On plain AND counts, both engines answer from the index alone and tie.
+- **Common words are still slow for both:** hundreds of milliseconds to seconds. `"a b"` with two frequent words means re-reading every post that has both. A positional index would fix that, at roughly 3× the index size (see [DESIGN](DESIGN.md#query-language)). WAND-style top-k would fix the ranked case.
+- **Recheck only the query's words.** The first version kept the positions of every word of each candidate row. Keeping only the query's words (`span::Wanted`) made positional queries 1.7–2× faster (`"a b"` p50: 994 → 538 ms).
+- **Exact:** on 28 queries, the index returned the same rows as a sequential scan with the same operator: 58,676 rows, 0 differences.
+- **tin and Postgres don't always agree on counts,** even for AND (0.9% average difference on 2-word phrases). The cause is tokenization, not matching: Postgres's parser indexes `kernel-devel` as a whole word *and* its parts, so for Postgres "yum install kernel" is not a phrase in "yum install kernel-devel" (tin: 40 rows, Postgres: 5). It also splits `you're` and keeps URLs whole. tin follows Unicode word boundaries.
+- **The Super User index now builds in 13.9 s** with 4 threads (parallel `CREATE INDEX`), vs 35.5 s serial in Phase 1 on a faster host. It is 154 MB (GIN: 388 MB).
+
+The Postgres numbers are from the first run. The tin numbers are from a second run of the same queries on the same server, after the recheck change.

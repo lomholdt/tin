@@ -15,27 +15,98 @@
 //! none. This evaluator works on one row at a time (rechecks), so it favours
 //! simple sorted-vector code over lazy iterators.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::pattern::osa_within;
 use crate::query::{Query, Slot};
 use crate::tokenize::Analyzer;
 
+fn hash(t: &str) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(t)
+}
+
 /// A closed interval of word positions.
 pub type Span = (u32, u32);
 
-/// One document's words: each distinct term with its positions.
+/// One document's words: each distinct term with its positions (only the
+/// terms a query can use, when built [`for`](DocWords::with) one).
 pub struct DocWords {
     terms: FxHashMap<String, Vec<u32>>,
     words: u32,
+    distinct: usize,
+}
+
+/// Which document terms a query looks at: its terms, or every term if it
+/// has patterns. Build once per query; it makes rechecks skip (and never
+/// allocate for) the other words of a row.
+pub struct Wanted {
+    terms: FxHashSet<String>,
+    all: bool,
+    /// Also count the document's distinct terms (for scoring).
+    count: bool,
+}
+
+impl Wanted {
+    pub fn new(q: &Query) -> Wanted {
+        let mut w = Wanted { terms: FxHashSet::default(), all: false, count: false };
+        w.add(q);
+        w
+    }
+
+    /// Like [`new`](Self::new), and [`DocWords::distinct_terms`] counts every
+    /// term of the document.
+    pub fn counting(q: &Query) -> Wanted {
+        Wanted { count: true, ..Wanted::new(q) }
+    }
+
+    fn add(&mut self, q: &Query) {
+        match q {
+            Query::Term(t) => {
+                self.terms.insert(t.clone());
+            }
+            Query::Prefix(_) | Query::Fragment(_) | Query::Fuzzy(..) => self.all = true,
+            Query::Not(q) | Query::Boost(q, _) => self.add(q),
+            Query::And(cs) | Query::Or(cs) | Query::AtLeast { of: cs, .. } => {
+                cs.iter().for_each(|c| self.add(c))
+            }
+            Query::Phrase { slots, .. } => slots.iter().flat_map(|s| &s.alts).for_each(|a| self.add(a)),
+            Query::Near { left, right, .. } => {
+                self.add(left);
+                self.add(right);
+            }
+        }
+    }
 }
 
 impl DocWords {
+    /// Every term of `text`.
     pub fn new(text: &str, analyzer: &mut Analyzer) -> DocWords {
+        Self::build(text, analyzer, None, true)
+    }
+
+    /// The terms of `text` that `wanted` names. [`distinct_terms`](Self::distinct_terms)
+    /// counts all of the document's terms only if `wanted` is
+    /// [`counting`](Wanted::counting).
+    pub fn with(text: &str, analyzer: &mut Analyzer, wanted: &Wanted) -> DocWords {
+        Self::build(text, analyzer, (!wanted.all).then_some(&wanted.terms), wanted.count)
+    }
+
+    fn build(text: &str, analyzer: &mut Analyzer, only: Option<&FxHashSet<String>>, count: bool) -> DocWords {
         let mut terms: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+        // Hashes of every term, to count distinct ones without keeping them.
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
         let mut words = 0;
         analyzer.for_each_term(text, |t, pos| {
             words = pos + 1;
+            if let Some(only) = only {
+                if count {
+                    seen.insert(hash(t));
+                }
+                if !only.contains(t) {
+                    return;
+                }
+            }
             match terms.get_mut(t) {
                 Some(v) => v.push(pos),
                 None => {
@@ -43,12 +114,13 @@ impl DocWords {
                 }
             }
         });
-        DocWords { terms, words }
+        let distinct = if only.is_some() && count { seen.len() } else { terms.len() };
+        DocWords { terms, words, distinct }
     }
 
-    /// Distinct terms.
+    /// Distinct terms in the document.
     pub fn distinct_terms(&self) -> usize {
-        self.terms.len()
+        self.distinct
     }
 
     /// Word positions in the document (dropped over-long words included).

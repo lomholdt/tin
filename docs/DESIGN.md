@@ -94,7 +94,36 @@ Queries run **group at a time** over a tree of cursors (`Term`, `And`, `Or`, `An
 
 ### Query language
 
-`a b` (AND), `a OR b`, `a -b` / `a NOT b`, parentheses. Keywords are upper-case only. `"phrases"` are rejected until Phase 5. A bare negation (`-a`, `a OR -b`) is an error, because it would need the whole table.
+Modelled on TIN's query language (TINQL, as documented in `planetscale/lead`; syntax and ideas only, no code):
+
+| Syntax | Meaning |
+|---|---|
+| `a b`, `a AND b` | both |
+| `a OR b`, `[a b c]` | any (commas in `[ ]` optional) |
+| `a AND NOT b`, `a -b`, `a NOT b` | `a` without `b` |
+| `"a b c"` | a phrase: consecutive words, in order |
+| `"a _ c"`, `"[a x] b"`, `"a b c"~2` | skip exactly one word; choices for one position; up to 2 extra words in all |
+| `a THEN/N b`, `a NEAR/N b` | `b` after `a` (or either order) with at most N words between |
+| `AT LEAST 2 OF [a b c]`, `AT LEAST 50% OF [...]`, `ALL OF [...]` | minimum match |
+| `a^2` | boost: scales the item's weight in scores |
+
+- **Precedence**, loosest first: `OR`, then `AND`/negation, then `THEN`/`NEAR` (left to right), then `^`. Keywords are upper case only.
+- **A word the analyzer splits** (`e-mail`) is a phrase of its parts.
+- **A bare negation** (`-a`, `a OR -b`) is an error, because it would need the whole table.
+- **Differences from TINQL:** a leading `-` negates, where TINQL keeps hyphens in the term. `~N` on a word is an edit distance with no fixed prefix. Not supported yet: `?` wildcards, `TO` ranges, `MATCHES`, `WITHIN`, positional filters and span relations.
+
+🔧 **Positions without a positional index.** The index stores only which rows hold a term, so a phrase or proximity query is planned as the terms it needs (`Plan::Recheck`), and each candidate row is rechecked against its word positions (`tin_core::span`):
+- Every query node denotes its set of **minimal intervals** of word positions (the Clarke–Cormack–Burkowski algebra that Boldi and Vigna made lazy). `AND` gives minimal windows over its operands, a phrase or `THEN` gives ordered windows within the distance, and so on. A row matches if the root's set is non-empty.
+- **Negation is row-level.** Under a negation the index may subtract only what it knows exactly: `a -"b c"` plans as `a`, not `a -b -c`.
+- **The trade:** a phrase of common words costs a recheck of every row holding all its words. The alternative, positions in the index, would roughly triple its size; see [BENCHMARKS](BENCHMARKS.md#phase-8-phrases-proximity-and-scoring) for what the recheck costs.
+
+### Scoring and highlighting
+
+- `tin_score(index, doc, q)`: **BM25** (k1 = 1.2, b = 0.75) over the query's positive terms. Like TIN, it re-reads the row: term frequencies come from the row's text, and the collection statistics from the index (live rows, per-term document frequency from each segment's dictionary and the pending list).
+- 🔧 **Length = distinct terms.** The index's postings add up to exactly the sum of each row's distinct terms (4-grams excluded), so the average length is exact without storing lengths.
+- **Weights:** each leaf gets the product of the boosts above it. A term matched by several leaves gets the sum, as in TINQL (`"craft beer"^3 OR craft` weighs `craft` 4). Terms under a negation don't count. Patterns score each row term they match.
+- `tin_score_inspect(index, doc, q)` returns the breakdown as JSON.
+- `tin_highlight(doc, q)` and `tin_snippet(doc, q, words)` mark the words that made the row match. For phrase and proximity terms, only occurrences inside a match are marked.
 
 Single-term patterns (Phase 4) combine with all of the above:
 
@@ -139,7 +168,7 @@ Single-term patterns (Phase 4) combine with all of the above:
 - UAX #29 word boundaries (`unicode-segmentation`), lower-casing, and NFKD accent stripping.
 - ✅ No stemming and no stop words by default. The post explains why ("The Who").
 - Tokens over 64 bytes are dropped: hashes, base64 blobs.
-- Word positions are already produced, for phrases later.
+- Word positions (and byte offsets, for highlighting) are produced alongside terms; phrases and proximity are checked against them.
 
 ## Postgres integration (`crates/pg_tin`)
 
@@ -227,4 +256,7 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
 
 ## What is not built yet
 
-See the [roadmap](ROADMAP.md): ranked top-k (an ordered index scan that stops at k), the update-storm benchmark, and later BM25, phrases, and the visibility-map `COUNT(*)`.
+See the [roadmap](ROADMAP.md). Among them:
+- **top-k by score inside the index** (WAND/block-max); today `ORDER BY tin_score(...) LIMIT k` scores every match;
+- the rest of TINQL (ranges, regex, positional filters, span relations);
+- the visibility-map `COUNT(*)`.

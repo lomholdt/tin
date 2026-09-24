@@ -18,7 +18,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::query::Query;
-use crate::span::DocWords;
+use crate::span::{DocWords, Wanted};
 
 /// BM25 term-frequency saturation.
 pub const K1: f64 = 1.2;
@@ -63,6 +63,7 @@ pub struct Explanation {
 /// part of a query scores depend on. Build once per query.
 pub struct Scorer {
     leaves: Vec<(Query, f64)>,
+    wanted: Wanted,
 }
 
 impl Scorer {
@@ -70,7 +71,13 @@ impl Scorer {
         let mut leaves: Vec<(Query, f64)> = Vec::new();
         collect(q, 1.0, &mut leaves);
         leaves.retain(|(_, w)| *w > 0.0);
-        Scorer { leaves }
+        Scorer { leaves, wanted: Wanted::counting(q) }
+    }
+
+    /// What to read from a document before scoring it:
+    /// `DocWords::with(text, analyzer, scorer.wanted())`.
+    pub fn wanted(&self) -> &Wanted {
+        &self.wanted
     }
 
     pub fn score(&self, doc: &DocWords, stats: &dyn CollectionStats) -> f64 {
@@ -148,7 +155,11 @@ mod tests {
     fn score(q: &str, doc: &str) -> Explanation {
         let mut a = Analyzer::new();
         let stats = Fixed([("common", 900), ("rare", 2), ("beer", 50), ("craft", 50)].into_iter().collect());
-        Scorer::new(&Query::parse(q, &mut a).unwrap()).explain(&DocWords::new(doc, &mut a), &stats)
+        let scorer = Scorer::new(&Query::parse(q, &mut a).unwrap());
+        let e = scorer.explain(&DocWords::with(doc, &mut a, scorer.wanted()), &stats);
+        // Reading only the query's terms changes nothing.
+        assert_eq!(e, scorer.explain(&DocWords::new(doc, &mut a), &stats));
+        e
     }
 
     #[test]

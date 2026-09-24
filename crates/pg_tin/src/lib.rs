@@ -11,6 +11,7 @@
 
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, PgRelation};
+use tin_core::span::{DocWords, Wanted};
 use tin_core::Analyzer;
 
 mod build;
@@ -71,15 +72,18 @@ pub extern "C-unwind" fn _PG_init() {
 #[pg_extern(immutable, parallel_safe, strict, cost = 10)]
 fn tin_match(doc: &str, query: &str) -> bool {
     thread_local! {
-        static LAST: std::cell::RefCell<Option<(String, tin_core::Query)>> =
+        static LAST: std::cell::RefCell<Option<(String, tin_core::Query, Wanted)>> =
             const { std::cell::RefCell::new(None) };
     }
     LAST.with(|last| {
         let mut last = last.borrow_mut();
-        if last.as_ref().is_none_or(|(q, _)| q != query) {
-            *last = Some((query.to_owned(), scan::parse_tinql(query)));
+        if last.as_ref().is_none_or(|(q, _, _)| q != query) {
+            let q = scan::parse_tinql(query);
+            let wanted = Wanted::new(&q);
+            *last = Some((query.to_owned(), q, wanted));
         }
-        last.as_ref().unwrap().1.matches_text(doc, &mut Analyzer::new())
+        let (_, q, wanted) = last.as_ref().unwrap();
+        DocWords::with(doc, &mut Analyzer::new(), wanted).matches(q)
     })
 }
 

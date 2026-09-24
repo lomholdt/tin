@@ -587,7 +587,7 @@ impl Query {
     /// Whether `text` matches: the exact answer, with word positions (the
     /// recheck and sequential-scan path).
     pub fn matches_text(&self, text: &str, analyzer: &mut Analyzer) -> bool {
-        crate::span::DocWords::new(text, analyzer).matches(self)
+        crate::span::DocWords::with(text, analyzer, &crate::span::Wanted::new(self)).matches(self)
     }
 }
 

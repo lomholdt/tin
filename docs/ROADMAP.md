@@ -105,13 +105,15 @@ At 5M rows: every query kind has p99 < 7 ms (budget 2) or < 2 ms (budget 1), wit
 2. ✅ **Segments in shared memory**: one copy for all backends, mapped and parsed in place. The first search on a new connection went from 1–5 s to ~20 ms, and the index is in memory once instead of once per connection ([results](BENCHMARKS-IDS.md#phase-7-step-2-segments-in-shared-memory)).
 3. ✅ **Parallel `CREATE INDEX`**: the backend scans, Rust threads build a segment per batch of blocks, and the final merge is split by term range across the same threads. At 5M rows on 4 cores: 204 s → **43 s** (4.7×), byte-identical to a serial build ([results](BENCHMARKS-IDS.md#phase-7-step-3-parallel-create-index)).
 
-## Phase 8: Long text: TINQL-style queries, scoring, highlighting
+## Phase 8: Long text: TINQL-style queries, scoring, highlighting ✅
 
 Ideas and syntax from TIN's query language (TINQL, as documented in `planetscale/lead`); no code taken (it is AGPL).
 
 1. ✅ **Positional queries**: phrases (`"a b c"`, `_` gaps, `[a b]` choices, `~N` slop), `THEN/N`, `NEAR/N`, `[alternatives]`, `AT LEAST n OF` / `n%` / `ALL OF`, `AND NOT`, boosts `^N`. The index has no positions, so it returns rows holding the terms and each candidate is rechecked with minimal-interval semantics (`span.rs`). Randomized tests check the recheck against a brute-force evaluator.
 2. ✅ **Scoring and highlighting**: `tin_score(index, doc, q)` is BM25. Term frequencies come from the row's text; row count, document frequencies and average length come from the index, so no format change was needed. Boosts weight terms. `tin_score_inspect` explains a score as JSON. `tin_highlight` / `tin_snippet` mark the words that made a row match.
-3. **Long-text benchmark** on the 1.24M Super User posts: phrases and proximity vs Postgres full-text search.
+3. ✅ **Long-text benchmark** on the 1.24M Super User posts: tin answers phrases, proximity and top-10-by-score **4–6.5× faster** than Postgres full-text search, with the same rows as a sequential scan on every query checked ([results](BENCHMARKS.md#phase-8-phrases-proximity-and-scoring)). Phrases of very common words still take seconds in both engines, because neither index has positions.
+
+**Next candidates:** top-k by score inside the index (WAND / block-max), so `ORDER BY tin_score(...) LIMIT 10` stops early; optional positions for phrase-heavy workloads; the rest of TINQL (ranges, regex, `WITHIN`, positional filters).
 
 ## Performance backlog (from Phase 0 profiling)
 
