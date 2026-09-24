@@ -168,6 +168,9 @@ impl Ranked {
     /// Buffer pending documents for which `pick(tier, passes_filter)`, as
     /// tier `tier`.
     fn pending_hits(&mut self, src: &Sources<'_>, pick: impl Fn(u8, bool) -> bool, tier: u8) {
+        // A filter with phrases or proximity only narrows pending documents
+        // down to candidates, like segments.
+        let recheck = self.filter.as_ref().is_some_and(Plan::needs_recheck);
         let (matcher, filter) = (&self.matcher, &self.filter);
         let info = self.pending.get_or_insert_with(|| {
             src.pending
@@ -180,7 +183,7 @@ impl Ranked {
         });
         for (d, &(t, ok)) in src.pending.iter().zip(info.iter()) {
             if pick(t, ok) && self.emitted.insert(d.tid) {
-                self.buf.push_back(Hit { tid: d.tid, tier, recheck: false, tier_is_bound: false });
+                self.buf.push_back(Hit { tid: d.tid, tier, recheck, tier_is_bound: false });
             }
         }
     }

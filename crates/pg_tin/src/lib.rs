@@ -63,19 +63,20 @@ pub extern "C-unwind" fn _PG_init() {
 }
 
 /// `doc ==> query`: the non-index path (sequential scans, rechecks). Uses the
-/// same analyzer and query semantics as the index. Analyzing each document
+/// same analyzer and query semantics as the index, plus word positions for
+/// phrases and proximity (which the index only narrows down). Analyzing each document
 /// costs roughly ten simple operators (0.4 µs a row on short identifiers),
 /// hence `cost = 10`.
 #[pg_extern(immutable, parallel_safe, strict, cost = 10)]
 fn tin_match(doc: &str, query: &str) -> bool {
     thread_local! {
-        static LAST: std::cell::RefCell<Option<(String, tin_core::Plan)>> =
+        static LAST: std::cell::RefCell<Option<(String, tin_core::Query)>> =
             const { std::cell::RefCell::new(None) };
     }
     LAST.with(|last| {
         let mut last = last.borrow_mut();
         if last.as_ref().is_none_or(|(q, _)| q != query) {
-            *last = Some((query.to_owned(), scan::parse_query(query)));
+            *last = Some((query.to_owned(), scan::parse_tinql(query)));
         }
         last.as_ref().unwrap().1.matches_text(doc, &mut Analyzer::new())
     })

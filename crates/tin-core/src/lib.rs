@@ -29,12 +29,13 @@ pub mod query;
 pub mod rank;
 pub mod search;
 pub mod segment;
+pub mod span;
 pub mod tid;
 pub mod tokenize;
 mod varint;
 
 pub use index::Index;
-pub use query::{Plan, Query, QueryError, SortedTerms, TermSet};
+pub use query::{Plan, Query, QueryError, Slot, SortedTerms, TermSet};
 pub use search::SearchBox;
 pub use segment::{Merge, MergeWriter, MergedPart, Segment, SegmentBuilder, TermFilter};
 pub use tid::Tid;

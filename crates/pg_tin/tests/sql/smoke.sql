@@ -43,7 +43,7 @@ SELECT q, (SELECT array_agg(id ORDER BY id) FROM docs WHERE body ==> q) = ids AS
 RESET enable_bitmapscan;
 
 -- Errors.
-SELECT 'x' ==> '"a phrase"';
+SELECT 'x' ==> '"a phrase';
 SELECT 'x' ==> '-only';
 SELECT * FROM tin_stats('docs'::regclass);
 
@@ -238,3 +238,42 @@ SET enable_bitmapscan = off;
 SELECT (SELECT count(*) FROM par WHERE txt LIKE '%msku00%') AS msku00, (SELECT count(*) FROM par WHERE txt LIKE '%4242%') AS frag;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
+
+-- Phrases, proximity, alternatives, AT LEAST (TINQL-style): the index
+-- returns candidates holding the terms, the recheck checks positions.
+CREATE TABLE prose (id int, body text);
+INSERT INTO prose VALUES
+  (1, 'the big bad wolf ate a big grey wolf'),
+  (2, 'a wolf that is big and bad'),
+  (3, 'craft pale beer and more beer'),
+  (4, 'beer made by a craft brewer'),
+  (5, 'send an e-mail to the wolf'),
+  (6, 'email the big bad wolf');
+INSERT INTO prose SELECT 100 + i, 'filler ' || i FROM generate_series(1, 2000) i;
+CREATE INDEX prose_tin ON prose USING tin (body);
+ANALYZE prose;
+CREATE FUNCTION prose_ids(q text) RETURNS int[] LANGUAGE sql AS $$
+  SELECT coalesce(array_agg(id ORDER BY id), '{}') FROM prose WHERE body ==> q $$;
+CREATE FUNCTION prose_same(q text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE bitmap int[]; ordered int[]; seq int[];
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off;
+  bitmap := prose_ids(q);
+  SET LOCAL enable_indexscan = on; SET LOCAL enable_bitmapscan = off;
+  ordered := prose_ids(q);
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+  seq := prose_ids(q);
+  RETURN bitmap = seq AND ordered = seq;
+END $$;
+SELECT q, prose_ids(q) AS ids, prose_same(q) AS index_eq_seqscan FROM unnest(ARRAY[
+  '"big bad wolf"', '"bad big wolf"', '"big _ wolf"', '"[big large] grey wolf"', '"big wolf"~1',
+  'big THEN/2 bad', 'big NEAR/2 bad', 'craft THEN/1 beer', 'beer NEAR/3 craft', 'e-mail', 'email',
+  'AT LEAST 2 OF [craft beer wolf]', 'ALL OF [big wolf]', 'wolf AND NOT "big bad"', 'wolf -"big bad" -e-mail',
+  '[craft email] beer^2']) q;
+-- Rows still in the pending list are matched the same way.
+INSERT INTO prose VALUES (7, 'big bad wolf again'), (8, 'bad big wolf'), (9, 'a big and bad wolf');
+SELECT q, prose_ids(q) AS ids, prose_same(q) AS index_eq_seqscan FROM unnest(ARRAY[
+  '"big bad wolf"', 'wolf AND NOT "big bad"', 'big THEN/1 bad']) q;
+EXPLAIN (COSTS OFF) SELECT id FROM prose WHERE body ==> '"big bad wolf"';
+SELECT 'x' ==> 'a THEN b';
+SELECT 'x' ==> 'AT LEAST 2 OF a';

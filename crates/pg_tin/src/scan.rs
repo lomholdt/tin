@@ -20,13 +20,14 @@
 //! that spans many `amgettuple` calls keeps a consistent snapshot cheaply.
 //!
 //! Tids are handed to the executor as exact (`recheck = false`), except for
-//! plans with `*fragment*` patterns answered through grams. That is sound
-//! because VACUUM clears a dead tuple's liveness bit (or drops its pending
-//! record) in `ambulkdelete`, before the heap can reuse its line pointer. A
-//! scan whose cached liveness predates such a VACUUM still only returns tids
-//! of tuples that were dead when the scan's snapshot was taken, and any tuple
-//! later placed in a reused slot is invisible to that snapshot, so the heap's
-//! visibility check drops it.
+//! `*fragment*` patterns answered through grams, and for phrases and
+//! proximity (the index only has their terms; the recheck has positions).
+//! That is sound because VACUUM clears a dead tuple's liveness bit (or drops
+//! its pending record) in `ambulkdelete`, before the heap can reuse its line
+//! pointer. A scan whose cached liveness predates such a VACUUM still only
+//! returns tids of tuples that were dead when the scan's snapshot was taken,
+//! and any tuple later placed in a reused slot is invisible to that snapshot,
+//! so the heap's visibility check drops it.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -143,7 +144,12 @@ unsafe fn refresh(index: pg_sys::Relation, st: &mut IndexState) {
 }
 
 pub fn parse_query(q: &str) -> Plan {
-    Plan::parse(q, &mut Analyzer::new()).unwrap_or_else(|e| error!("tin: invalid query {q:?}: {e}"))
+    Plan::from_query(&parse_tinql(q)).unwrap_or_else(|e| error!("tin: invalid query {q:?}: {e}"))
+}
+
+pub fn parse_tinql(q: &str) -> tin_core::Query {
+    tin_core::Query::parse(q, &mut Analyzer::new())
+        .unwrap_or_else(|e| error!("tin: invalid query {q:?}: {e}"))
 }
 
 /// A search box, with this session's `tin.search_typos`.

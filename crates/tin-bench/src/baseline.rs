@@ -86,6 +86,7 @@ impl Baseline {
                 }
                 acc
             }
+            Plan::Recheck(p) => self.eval(p),
             Plan::AndNot(p, n) => {
                 let p = self.eval(p);
                 let n = self.eval(n);

@@ -39,6 +39,10 @@ const DENSE_GRAM_FACTOR: u64 = 10;
 /// there are no grams to consult.
 const FRAGMENT_GUESS: f64 = 1e-3;
 
+/// Share of candidates [`Segment::estimate`] assumes pass a phrase or
+/// proximity recheck.
+const RECHECK_PASS: f64 = 0.5;
+
 /// The smallest key above every key starting with `p` (`None`: no bound).
 fn prefix_end(p: &[u8]) -> Option<Vec<u8>> {
     let mut end = p.to_vec();
@@ -609,6 +613,7 @@ impl Segment {
                     _ => Box::new(Or::new(kids)),
                 }
             }
+            Plan::Recheck(p) => self.cursor_in(p, negated),
             Plan::AndNot(p, n) => {
                 let pos = self.cursor_in(p, negated);
                 if pos.cost() == 0 {
@@ -678,6 +683,8 @@ impl Segment {
             Plan::And(cs) => cs.iter().map(|c| self.fraction(c)).product(),
             Plan::Or(cs) => 1.0 - cs.iter().map(|c| 1.0 - self.fraction(c)).product::<f64>(),
             Plan::AndNot(p, q) => self.fraction(p) * (1.0 - self.fraction(q)),
+            // Phrases and proximity match a part of their terms' rows; a guess.
+            Plan::Recheck(p) => self.fraction(p) * RECHECK_PASS,
         };
         f.clamp(0.0, 1.0)
     }

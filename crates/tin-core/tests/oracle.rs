@@ -101,6 +101,7 @@ fn eval(plan: &Plan, truth: &BTreeMap<String, BTreeSet<Tid>>) -> BTreeSet<Tid> {
         }
         Plan::Or(cs) => cs.iter().map(|c| eval(c, truth)).fold(BTreeSet::new(), |acc, s| &acc | &s),
         Plan::AndNot(p, n) => &eval(p, truth) - &eval(n, truth),
+        Plan::Recheck(p) => eval(p, truth),
     }
 }
 
