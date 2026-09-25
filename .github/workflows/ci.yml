@@ -43,3 +43,5 @@ jobs:
       - run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
       - run: cargo clippy -p pg_tin -- -D warnings
       - run: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config sh scripts/pg-test.sh
+      # Streaming standby, point-in-time recovery and promotion (generated corpus).
+      - run: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config ROUNDS=2 SECONDS=10 sh crates/pg_tin/tests/replica/run.sh

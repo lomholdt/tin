@@ -8,7 +8,10 @@
 //! the small page directory and docs bitmap.
 //!
 //! A registry in a named DSM segment (`GetNamedDSMSegment`, PG 17+) maps
-//! (index relfile, segment's first block) to a DSM handle. Entries are
+//! (index relfile, segment's first block, segment id) to a DSM handle. The
+//! id matters on hot standbys: WAL replay frees and reuses pages without
+//! telling the registry, so a new segment can start at an old one's block;
+//! ids are never reused within an index. Entries are
 //! pinned, so a segment outlives the backend that loaded it, and unpinned
 //! when VACUUM frees the segment's pages ([`forget`]) or, least recently
 //! used first, when `tin.shared_cache_size` is exceeded. Unpinned memory
@@ -37,6 +40,7 @@ struct Entry {
     db: pg_sys::Oid,
     rel: pg_sys::RelFileNumber,
     head: u32,
+    id: u32,
     len: u64,
     handle: pg_sys::dsm_handle,
     last_use: u64,
@@ -74,7 +78,9 @@ unsafe fn registry() -> *mut Registry {
         if r.get().is_null() {
             let mut found = false;
             let reg = pg_sys::GetNamedDSMSegment(
-                c"pg_tin segments".as_ptr(),
+                // Versioned: a new layout must not read an old registry
+                // left in a running server by the previous library.
+                c"pg_tin segments v2".as_ptr(),
                 std::mem::size_of::<Registry>(),
                 Some(init_registry),
                 &mut found,
@@ -144,6 +150,7 @@ fn mapped(handle: pg_sys::dsm_handle) -> Option<Bytes> {
     })
 }
 
+/// An entry for the chain starting at `head` (whichever segment it holds).
 fn same(e: &Entry, loc: &pg_sys::RelFileLocator, head: u32) -> bool {
     e.used && e.spc == loc.spcOid && e.db == loc.dbOid && e.rel == loc.relNumber && e.head == head
 }
@@ -170,7 +177,8 @@ unsafe fn shared_bytes(index: pg_sys::Relation, r: &SegmentRef, cap: u64) -> Byt
     let now = (*reg).clock;
     let entries = &mut (*reg).entries;
     if let Some(e) = entries.iter_mut().find(|e| same(e, &loc, r.first_block)) {
-        if e.len == r.len {
+        // Another segment at the same block (replay reused its pages) is stale.
+        if e.id == r.id && e.len == r.len {
             if let Some(b) = mapped(e.handle) {
                 e.last_use = now;
                 pg_sys::LWLockRelease(&mut (*reg).lock);
@@ -192,7 +200,7 @@ unsafe fn shared_bytes(index: pg_sys::Relation, r: &SegmentRef, cap: u64) -> Byt
                 pg_sys::dsm_detach(seg);
             }
         }
-        // Stale (can't normally happen): drop it and load afresh.
+        // Stale: drop it and load afresh.
         pg_sys::dsm_unpin_segment(e.handle);
         (*reg).bytes -= e.len;
         e.used = false;
@@ -222,6 +230,7 @@ unsafe fn shared_bytes(index: pg_sys::Relation, r: &SegmentRef, cap: u64) -> Byt
         db: loc.dbOid,
         rel: loc.relNumber,
         head: r.first_block,
+        id: r.id,
         len: r.len,
         handle: pg_sys::dsm_segment_handle(seg),
         last_use: now,
@@ -231,10 +240,10 @@ unsafe fn shared_bytes(index: pg_sys::Relation, r: &SegmentRef, cap: u64) -> Byt
     map(seg, r.len as usize)
 }
 
-/// Put a just-installed segment (its serialized `bytes`, whose chain starts
-/// at `head`) into shared memory, so readers map it instead of copying it
-/// in. Best effort: skipped if it doesn't fit.
-pub unsafe fn publish(index: pg_sys::Relation, head: u32, bytes: &[u8]) {
+/// Put a just-installed segment (segment `id`, its serialized `bytes`,
+/// whose chain starts at `head`) into shared memory, so readers map it
+/// instead of copying it in. Best effort: skipped if it doesn't fit.
+pub unsafe fn publish(index: pg_sys::Relation, head: u32, id: u32, bytes: &[u8]) {
     let cap = SHARED_CACHE_MB.get() as u64 * 1024 * 1024;
     let len = bytes.len() as u64;
     if cap == 0 || len > cap {
@@ -244,9 +253,14 @@ pub unsafe fn publish(index: pg_sys::Relation, head: u32, bytes: &[u8]) {
     let loc = (*index).rd_locator;
     pg_sys::LWLockAcquire(&mut (*reg).lock, pg_sys::LWLockMode::LW_EXCLUSIVE);
     let entries = &mut (*reg).entries;
-    if entries.iter().any(|e| same(e, &loc, head)) {
-        pg_sys::LWLockRelease(&mut (*reg).lock);
-        return;
+    if let Some(e) = entries.iter_mut().find(|e| same(e, &loc, head)) {
+        if e.id == id {
+            pg_sys::LWLockRelease(&mut (*reg).lock);
+            return;
+        }
+        pg_sys::dsm_unpin_segment(e.handle);
+        (*reg).bytes -= e.len;
+        e.used = false;
     }
     (*reg).clock += 1;
     let now = (*reg).clock;
@@ -273,6 +287,7 @@ pub unsafe fn publish(index: pg_sys::Relation, head: u32, bytes: &[u8]) {
         db: loc.dbOid,
         rel: loc.relNumber,
         head,
+        id,
         len,
         handle: pg_sys::dsm_segment_handle(seg),
         last_use: now,

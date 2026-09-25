@@ -310,8 +310,8 @@ impl Written {
     /// Publish the blobs of segments that made it into `meta`.
     unsafe fn publish(&self, index: pg_sys::Relation, meta: &Meta) {
         for (head, bytes) in &self.blobs {
-            if meta.segments.iter().any(|r| r.first_block == *head) {
-                crate::shared::publish(index, *head, bytes);
+            if let Some(r) = meta.segments.iter().find(|r| r.first_block == *head) {
+                crate::shared::publish(index, *head, r.id, bytes);
             }
         }
     }

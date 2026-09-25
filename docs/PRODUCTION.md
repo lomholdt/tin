@@ -75,7 +75,10 @@ SELECT * FROM tin_shared_stats();                       -- segments and bytes in
 
 ## 7. Durability and limits
 
-- **Crash-safe:** every index write is WAL-logged (generic WAL). `kill -9` mid-storm, followed by recovery, gave 0 wrong results. Streaming replicas and point-in-time recovery follow from WAL, but haven't been tested yet.
+- **Crash-safe:** every index write is WAL-logged (generic WAL). `kill -9` mid-storm, followed by recovery, gave 0 wrong results.
+- **Replicas and point-in-time recovery: tested** (`crates/pg_tin/tests/replica/run.sh`, run in CI). It covers a streaming hot standby queried while it replays write storms, flushes, VACUUM/compaction and `REINDEX CONCURRENTLY`, then recovery to a restore point, then promotion. Every check returned the primary's rows and matched a sequential scan.
+  - **Use pg_tin 0.2.1 or later on the primary.** WAL written by earlier builds could deadlock a hot standby: replay stops while a query runs, and it never resumes. The fix is in how the primary writes WAL, so upgrade the primary; replicas need the same build installed.
+  - **Set `hot_standby_feedback = on` on replicas you query.** Without it, the standby cancels queries that conflict with replayed cleanup: 393 of ~500 test queries during heavy writes. That is standard Postgres behaviour, not specific to tin.
 - **Inserts into one index are serialized** on its metapage lock. The appends are short; flushes and merges run off the lock. Measured: ~4,200 updates/s with concurrent search p99 11 ms.
 - **At most 253 segments per index.** Compaction and tiered merges keep it far lower; if a build hits the limit, raise `maintenance_work_mem`.
 - **First query after a server restart** copies each segment into shared memory (~1 s at 5M rows). Every later connection maps it (~20 ms). Warm up with one search after a restart.

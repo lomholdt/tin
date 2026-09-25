@@ -272,8 +272,18 @@ unsafe fn alloc_page(index: pg_sys::Relation) -> Locked {
 
 /// Apply `f` to the pages of `bufs` inside one Generic WAL record. `full`
 /// marks buffers whose previous contents don't matter (new pages).
+///
+/// Lock order: on a hot standby, redo locks a record's pages in the order
+/// given here, while readers lock the metapage first and then one other
+/// page at a time. So the metapage, if present, must come first, or replay
+/// and a reader can wait on each other forever (buffer locks have no
+/// deadlock detection).
 unsafe fn logged(index: pg_sys::Relation, bufs: &[(&Locked, bool)], f: impl FnOnce(&[pg_sys::Page])) {
     assert!(bufs.len() <= 4, "generic WAL records hold at most 4 pages");
+    assert!(
+        bufs.iter().skip(1).all(|(b, _)| pg_sys::BufferGetBlockNumber(b.0) != 0),
+        "the metapage must be a WAL record's first page"
+    );
     let state = pg_sys::GenericXLogStart(index);
     let pages: Vec<pg_sys::Page> = bufs
         .iter()
@@ -561,9 +571,14 @@ pub unsafe fn append_pending(index: pg_sys::Relation, lock: &MetaLock, meta: &mu
             meta.pending_bytes += record.len() as u64;
             meta.pending_count += 1;
             let bytes = meta.encode();
-            logged(index, &[(&tail, false), (&lock.0, false)], |p| {
-                write_at(p[0], offset, chunk);
-                init_page(p[1], &bytes);
+            // The metapage goes first: redo locks a record's pages in this
+            // order, and readers lock the metapage before any other page.
+            // Tail first deadlocked hot standbys (replay held the tail and
+            // waited for the metapage a reader held while it waited for the
+            // tail).
+            logged(index, &[(&lock.0, false), (&tail, false)], |p| {
+                init_page(p[0], &bytes);
+                write_at(p[1], offset, chunk);
             });
             return;
         }

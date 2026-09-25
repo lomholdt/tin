@@ -263,6 +263,14 @@ SELECT tin_flush('posts_body_tin'::regclass);           -- flush the pending lis
   - add the old install script to `crates/pg_tin/tests/upgrade/` as the fixture `pg-test.sh` upgrades from.
 - The generated scripts are idempotent. Every function is `CREATE OR REPLACE`d; `TABLE` functions are dropped and recreated; missing operators and operator-class members are added. So a database built from any development snapshot of the old version converges to the new one. Removed objects must be dropped by hand.
 
+### WAL and hot standbys
+
+- Every change is a Generic WAL record of up to 4 pages. On a standby, redo locks a record's pages in the order they were registered.
+- Readers lock the metapage, then at most one other page at a time. So **the metapage must be a record's first page**: `logged()` asserts it.
+  - Until 0.2.1, a pending-list append logged its tail page before the metapage. Replay could then hold the tail and wait for the metapage, while a reader held the metapage and waited for the tail. Buffer locks have no deadlock detection, so replay hung.
+  - The replica test found it, and it fails within a minute if the order is reversed.
+- **Shared segment cache keys include the segment id.** Replay frees and reuses pages without telling the shared registry, so a new segment can start at an old one's first block. Ids are never reused within an index, so a stale entry can't be mistaken for the new one.
+
 ### Known limits
 
 - Inserts into one index are serialized on the metapage lock (appends are short; flushes and merges run off it).
